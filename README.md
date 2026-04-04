@@ -52,7 +52,3 @@ pitchDetectorDestroy(d);
     dependencies: ["PitchDSP"]
 )
 ```
-
-## License
-
-MIT

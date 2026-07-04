@@ -30,7 +30,7 @@
 //          │
 //          ▼
 //   ┌─────────────────────┐
-//   │ Mains Hum Suppressio│  Zero bins below 62 Hz.
+//   │ Mains Hum Suppressio│  Zero bins below 27 Hz.
 //   └──────┬──────────────┘
 //          │
 //          ▼
@@ -69,7 +69,7 @@
 #define NUM_HPS            5       // Number of harmonic product spectrums
 #define POWER_THRESH       1e-6f   // Minimum signal power to activate
 #define WHITE_NOISE_THRESH 0.2f    // Octave-band noise gate fraction
-#define MAINS_HUM_FREQ     62.0f  // Zero all bins below this frequency
+#define MAINS_HUM_FREQ     27.0f  // Zero all bins below this frequency (A0 = 27.5 Hz; was 62 Hz which wrongly killed A1 = 55 Hz)
 #define CONCERT_PITCH      440.0f // A4 reference
 #define HOP_DIVISOR        4      // Analyze every window/4 samples
 #define NOTE_BUFFER_SIZE   2      // Consecutive matches needed to lock

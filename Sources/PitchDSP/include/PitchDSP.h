@@ -11,6 +11,7 @@
 // Usage:
 //   PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
 //   cfg.noteStability = 3;          // optional: tweak before creating
+//   cfg.hopDivisor    = 8;          // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
 //   PitchDetector* d = pitchDetectorCreate(8192, 48000.0f, cfg);
 //
 //   // In your audio callback or processing loop:
@@ -75,6 +76,12 @@ typedef struct {
     /// note before the result is updated. Higher = more stable but slower.
     /// Range: 1 (off) to 8. Default: 2.
     int   noteStability;
+
+    /// Controls how often FFT analysis runs: every (windowSize / hopDivisor) samples.
+    /// Higher = more frequent analyses = smoother display, more CPU.
+    /// Range: 1 (every sample — impractical) to windowSize (1 analysis per window).
+    /// Default: 8 (~47fps at 48 kHz with windowSize=8192).
+    int   hopDivisor;
 } PitchDetectorConfig;
 
 // ---------------------------------------------------------------------------

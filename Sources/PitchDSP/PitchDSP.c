@@ -68,7 +68,7 @@
 
 #define NUM_HPS              5       // Number of harmonic product spectrums
 #define CONCERT_PITCH        440.0f  // A4 reference
-#define HOP_DIVISOR          4       // Analyze every window/4 samples
+#define HOP_DIVISOR_DEFAULT  8       // Default: analyze every window/8 samples (~47fps @ 48kHz)
 #define NOTE_BUFFER_MAX      8       // Maximum noteStability value
 
 #define NUM_OCTAVE_BANDS   12
@@ -206,15 +206,17 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     cfg.mainsHumFreq       = 27.0f;  // just below A0 (27.5 Hz), the lowest note we detect
     cfg.noiseGateThreshold = 0.2f;   // fraction of band RMS
     cfg.noteStability      = 2;      // consecutive DSP frames required to lock
+    cfg.hopDivisor         = HOP_DIVISOR_DEFAULT;
     return cfg;
 }
 
 PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetectorConfig config) {
     if (windowSize < 64 || sampleRate <= 0.0f) return NULL;
 
-    // Clamp noteStability to valid range
+    // Clamp to valid ranges
     if (config.noteStability < 1) config.noteStability = 1;
     if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
+    if (config.hopDivisor < 1) config.hopDivisor = 1;
 
     PitchDetector *d = (PitchDetector *)calloc(1, sizeof(PitchDetector));
     if (!d) return NULL;
@@ -223,7 +225,7 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
     d->fftSize    = next_pow2(windowSize);
     d->halfFFT    = d->fftSize / 2;
     d->deltaFreq  = sampleRate / (float)d->fftSize;
-    d->hopSize    = d->fftSize / HOP_DIVISOR;
+    d->hopSize    = d->fftSize / config.hopDivisor;
     if (d->hopSize < 1) d->hopSize = 1;
     d->config     = config;
 
@@ -269,7 +271,10 @@ void pitchDetectorConfigure(PitchDetector *d, PitchDetectorConfig config) {
     if (!d) return;
     if (config.noteStability < 1) config.noteStability = 1;
     if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
-    d->config = config;
+    if (config.hopDivisor < 1) config.hopDivisor = 1;
+    d->config   = config;
+    d->hopSize  = d->fftSize / config.hopDivisor;
+    if (d->hopSize < 1) d->hopSize = 1;
 }
 
 void pitchDetectorDestroy(PitchDetector *d) {

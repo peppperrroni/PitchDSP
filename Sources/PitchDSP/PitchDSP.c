@@ -441,14 +441,17 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
 
     // =================================================================
     //  10. Harmonic Product Spectrum
-    //      Multiply spectrum with decimated copies of itself.
-    //      Harmonics at 2F, 3F, 4F, 5F align with fundamental → sharp peak.
+    //      hpsSpec = mag × mag[2i] × mag[3i] × mag[4i] × mag[5i]
+    //
+    //      Loop starts at factor=2 (h=1). Factor=1 is already in hpsSpec via
+    //      the memcpy — multiplying again would square the spectrum and
+    //      over-amplify any harmonic that's louder than the fundamental.
     // =================================================================
 
     memcpy(d->hpsSpec, d->magSpecInterp, (size_t)interpSize * sizeof(float));
     int hpsLen = interpSize;
 
-    for (int h = 0; h < NUM_HPS; h++) {
+    for (int h = 1; h < NUM_HPS; h++) {      // start at h=1 → factor=2
         int factor = h + 1;
         int newLen = (interpSize + factor - 1) / factor;  // ceil division
         if (newLen > hpsLen) newLen = hpsLen;
@@ -484,6 +487,32 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
 
     // Frequency range guard
     if (maxFreq < 27.0f || maxFreq > 4200.0f) return;
+
+    // =================================================================
+    //  11b. Subharmonic correction
+    //       If the HPS peak is at F, but F/2 or F/3 has significant energy
+    //       in the interpolated spectrum, the true fundamental is likely
+    //       the lower note and our peak is its harmonic.
+    //
+    //       Example: E4 = 330 Hz, 3rd harmonic = 990 Hz ≈ B5.
+    //       If HPS peaks at 990 Hz but mag[330 Hz] > 15% of mag[990 Hz],
+    //       output 330 Hz (E4) instead.
+    // =================================================================
+
+    for (int div = 2; div <= 3; div++) {
+        float subFreq = maxFreq / (float)div;
+        if (subFreq < 27.0f) break;
+        int subBin = (int)(subFreq * (float)NUM_HPS / d->deltaFreq);
+        if (subBin >= 0 && subBin < interpSize) {
+            float subMag  = d->magSpecInterp[subBin];
+            float peakMag = d->magSpecInterp[maxIdx];
+            if (peakMag > 0.0f && subMag > 0.15f * peakMag) {
+                maxFreq = subFreq;
+                maxIdx  = subBin;
+                break;
+            }
+        }
+    }
 
     // =================================================================
     //  12. MIDI note + cents

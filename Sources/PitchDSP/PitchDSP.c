@@ -153,10 +153,8 @@ static float midi_to_freq(int midi) {
 static float compute_cents(float hz, int midi) {
     float noteHz = midi_to_freq(midi);
     if (noteHz <= 0.0f || hz <= 0.0f) return 0.0f;
-    float c = 1200.0f * log2f(hz / noteHz);
-    if (c < -50.0f) c = -50.0f;
-    if (c >  50.0f) c =  50.0f;
-    return c;
+    // Raw cents — unclamped. Caller is responsible for clamping to ±50 for display.
+    return 1200.0f * log2f(hz / noteHz);
 }
 
 // ==========================================================================
@@ -190,7 +188,9 @@ struct PitchDetector {
 
     // Note stability (max-size fixed array, runtime limit = config.noteStability)
     int    noteBuffer[NOTE_BUFFER_MAX];
-    float  smoothedCents;
+
+    // Sequence counter — increments on every fresh analysis cycle
+    uint32_t analysisCount;
 
     // Output
     PitchResult result;
@@ -202,11 +202,12 @@ struct PitchDetector {
 
 PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     PitchDetectorConfig cfg;
-    cfg.powerThreshold     = 1e-5f;  // ~-50 dBFS — cuts off body resonances during string decay
-    cfg.mainsHumFreq       = 27.0f;  // just below A0 (27.5 Hz), the lowest note we detect
-    cfg.noiseGateThreshold = 0.2f;   // fraction of band RMS
-    cfg.noteStability      = 2;      // consecutive DSP frames required to lock
-    cfg.hopDivisor         = HOP_DIVISOR_DEFAULT;
+    cfg.powerThreshold      = 1e-5f;  // ~-50 dBFS — cuts off body resonances during string decay
+    cfg.mainsHumFreq        = 27.0f;  // just below A0 (27.5 Hz), the lowest note we detect
+    cfg.noiseGateThreshold  = 0.2f;   // fraction of band RMS
+    cfg.noteStability       = 1;      // 1 = pass every frame; Swift owns all debounce
+    cfg.hopDivisor          = HOP_DIVISOR_DEFAULT;
+    cfg.subharmonicThreshold = 0.20f; // subharmonic magnitude must be ≥20% of HPS peak
     return cfg;
 }
 
@@ -316,6 +317,7 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     if (d->samplesInBuffer < d->fftSize) return;
     if (d->samplesSinceAnalysis < d->hopSize) return;
     d->samplesSinceAnalysis = 0;
+    d->analysisCount++;
 
     // =================================================================
     //  2. Extract window start position
@@ -342,9 +344,9 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
         d->result.midi       = -1;
         d->result.confidence =  0.0f;
         d->result.stability  =  0.0f;
+        d->result.sequence   =  d->analysisCount;
         for (int i = 0; i < NOTE_BUFFER_MAX; i++)
             d->noteBuffer[i] = -1;
-        d->smoothedCents = 0.0f;
         return;
     }
 
@@ -489,28 +491,59 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     if (maxFreq < 27.0f || maxFreq > 4200.0f) return;
 
     // =================================================================
-    //  11b. Subharmonic correction
-    //       If the HPS peak is at F, but F/2 or F/3 has significant energy
-    //       in the interpolated spectrum, the true fundamental is likely
-    //       the lower note and our peak is its harmonic.
-    //
-    //       Example: E4 = 330 Hz, 3rd harmonic = 990 Hz ≈ B5.
-    //       If HPS peaks at 990 Hz but mag[330 Hz] > 15% of mag[990 Hz],
-    //       output 330 Hz (E4) instead.
+    //  11b. Confidence — HPS peak-to-average ratio
+    //       Clean fundamentals produce a sharp, isolated HPS peak.
+    //       Noise or body resonances produce a flatter spectrum.
+    //       Normalized so peak/avg ≥ 10 → confidence = 1.0.
     // =================================================================
 
+    float hpsSum = 0.0f;
+    for (int i = 0; i < hpsLen; i++)
+        hpsSum += d->hpsSpec[i];
+    float hpsAvg = (hpsLen > 0) ? (hpsSum / (float)hpsLen) : 1e-20f;
+    if (hpsAvg < 1e-20f) hpsAvg = 1e-20f;
+    float confidence = maxVal / (hpsAvg * 10.0f);
+    if (confidence > 1.0f) confidence = 1.0f;
+
+    // =================================================================
+    //  11c. Subharmonic correction
+    //       If the HPS peak is at F, search a ±3-bin neighborhood around
+    //       F/2 and F/3 in the interpolated spectrum. If the local maximum
+    //       there exceeds `subharmonicThreshold` × the HPS peak magnitude,
+    //       the lower frequency is the true fundamental.
+    //
+    //       Example: E4 = 330 Hz, 3rd harmonic = 990 Hz ≈ B5.
+    //       If HPS peaks at 990 Hz but the neighborhood of 330 Hz has
+    //       significant energy (≥20% of HPS peak), output 330 Hz (E4).
+    // =================================================================
+
+    float peakMag = d->magSpecInterp[maxIdx];
     for (int div = 2; div <= 3; div++) {
         float subFreq = maxFreq / (float)div;
         if (subFreq < 27.0f) break;
-        int subBin = (int)(subFreq * (float)NUM_HPS / d->deltaFreq);
-        if (subBin >= 0 && subBin < interpSize) {
-            float subMag  = d->magSpecInterp[subBin];
-            float peakMag = d->magSpecInterp[maxIdx];
-            if (peakMag > 0.0f && subMag > 0.15f * peakMag) {
-                maxFreq = subFreq;
-                maxIdx  = subBin;
-                break;
+
+        // Center bin for the subharmonic candidate
+        int subBinCenter = (int)(subFreq * (float)NUM_HPS / d->deltaFreq);
+
+        // Search ±3 bins for local maximum
+        int searchStart = subBinCenter - 3;
+        int searchEnd   = subBinCenter + 3;
+        if (searchStart < 0)          searchStart = 0;
+        if (searchEnd >= interpSize)  searchEnd   = interpSize - 1;
+
+        float localMax    = 0.0f;
+        int   localMaxBin = subBinCenter;
+        for (int j = searchStart; j <= searchEnd; j++) {
+            if (d->magSpecInterp[j] > localMax) {
+                localMax    = d->magSpecInterp[j];
+                localMaxBin = j;
             }
+        }
+
+        if (peakMag > 0.0f && localMax > d->config.subharmonicThreshold * peakMag) {
+            maxFreq = (float)localMaxBin * d->deltaFreq / (float)NUM_HPS;
+            maxIdx  = localMaxBin;
+            break;
         }
     }
 
@@ -544,17 +577,12 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     }
 
     if (stable) {
-        // Two consecutive frames agree → update result
-        if (midi != d->result.midi) {
-            d->smoothedCents = cents;  // reset on note change
-        } else {
-            d->smoothedCents = d->smoothedCents * 0.7f + cents * 0.3f;
-        }
         d->result.hz         = maxFreq;
-        d->result.cents      = d->smoothedCents;
+        d->result.cents      = cents;       // raw, unclamped — Swift clamps for display
         d->result.midi       = midi;
-        d->result.confidence = 1.0f;
+        d->result.confidence = confidence;
         d->result.stability  = 1.0f;
+        d->result.sequence   = d->analysisCount;
     }
     // If not stable, keep previous result (prevents flicker)
 }

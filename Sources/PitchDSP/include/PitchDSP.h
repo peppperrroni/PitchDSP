@@ -10,7 +10,7 @@
 //
 // Usage:
 //   PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
-//   cfg.noteStability = 3;          // optional: tweak before creating
+//   cfg.noteStability = 1;          // set to 1 — let Swift own all debounce
 //   cfg.hopDivisor    = 8;          // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
 //   PitchDetector* d = pitchDetectorCreate(8192, 48000.0f, cfg);
 //
@@ -19,7 +19,10 @@
 //
 //   // In your UI update (e.g. 30-60 Hz timer):
 //   PitchResult r = pitchDetectorGetResult(d);
-//   if (r.hz > 0) { /* display note, cents, needle, etc. */ }
+//   if (r.sequence != lastSequence && r.hz > 0) {
+//       lastSequence = r.sequence;
+//       /* display note, cents, needle, etc. */
+//   }
 //
 //   // Adjust parameters at any time (takes effect on next analysis):
 //   cfg.powerThreshold = 1e-4f;
@@ -34,6 +37,8 @@
 #ifndef PITCH_DSP_H
 #define PITCH_DSP_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,11 +48,12 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    float hz;           // Detected pitch in Hz. -1 if no pitch detected.
-    float cents;        // Deviation from nearest note in cents (-50 .. +50).
-    int   midi;         // Nearest MIDI note number (0-127). -1 if no pitch.
-    float confidence;   // 0.0 .. 1.0 based on HPS peak prominence.
-    float stability;    // 0.0 .. 1.0 note stability score.
+    float    hz;           // Detected pitch in Hz. -1 if no pitch detected.
+    float    cents;        // Raw deviation from nearest note in cents (unclamped — may exceed ±50).
+    int      midi;         // Nearest MIDI note number (0-127). -1 if no pitch.
+    float    confidence;   // 0.0 .. 1.0 based on HPS peak-to-average ratio.
+    float    stability;    // 0.0 .. 1.0 note stability score.
+    uint32_t sequence;     // Increments on every fresh analysis. Compare to detect stale reads.
 } PitchResult;
 
 // ---------------------------------------------------------------------------
@@ -82,6 +88,13 @@ typedef struct {
     /// Range: 1 (every sample — impractical) to windowSize (1 analysis per window).
     /// Default: 8 (~47fps at 48 kHz with windowSize=8192).
     int   hopDivisor;
+
+    /// Minimum ratio of subharmonic magnitude to HPS peak magnitude for subharmonic
+    /// correction to trigger. If the candidate fundamental (at F/2 or F/3) has at
+    /// least this fraction of the peak's energy, the lower frequency is preferred.
+    /// Typical range: 0.1 (aggressive) to 0.4 (conservative).
+    /// Default: 0.20.
+    float subharmonicThreshold;
 } PitchDetectorConfig;
 
 // ---------------------------------------------------------------------------

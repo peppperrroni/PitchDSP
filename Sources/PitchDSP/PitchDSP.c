@@ -71,13 +71,22 @@
 #define HOP_DIVISOR          4       // Analyze every window/4 samples
 #define NOTE_BUFFER_MAX      8       // Maximum noteStability value
 
-#define NUM_OCTAVE_BANDS   11
-// Band boundaries chosen so A1 (55 Hz) has its own band (27–65 Hz),
-// separate from D2 (73 Hz) which falls in the next band (65–130 Hz).
-// Previously the first band was 50–100 Hz, which put A1 and D2 together:
-// D2 was louder → noise gate zeroed A1's fundamental → HPS locked on D2.
+#define NUM_OCTAVE_BANDS   12
+// Band boundaries ensure each critical note group has its own noise gate band.
+//
+// Split history:
+//   1.0.2: Split at 65 Hz → separated A1 (55 Hz) from D2 (73 Hz).
+//          Previously band 50-100 Hz caused D2 to zero A1's fundamental.
+//   1.0.4: Split at 43 Hz → separated E1 (41 Hz) from A1 (55 Hz).
+//          Band 27-65 Hz caused E1 body resonances to zero A1's fundamental;
+//          HPS found E1 because E1's 4th harmonic (164 Hz) ≈ A1's 3rd (165 Hz).
+//
+// Current bands (low range):
+//   27-43 Hz : B0, C1, C#1, D1, D#1, E1 (41.2 Hz)
+//   43-65 Hz : F1, F#1, G1, G#1, A1 (55 Hz), A#1, B1
+//   65-130 Hz: C2, C#2, D2 (73 Hz) ...
 static const float OCTAVE_BANDS[NUM_OCTAVE_BANDS] = {
-    27, 65, 130, 260, 520, 1040, 2080, 4160, 8320, 16640, 25600
+    27, 43, 65, 130, 260, 520, 1040, 2080, 4160, 8320, 16640, 25600
 };
 
 // ==========================================================================

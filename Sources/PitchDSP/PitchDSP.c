@@ -74,9 +74,13 @@
 #define HOP_DIVISOR        4      // Analyze every window/4 samples
 #define NOTE_BUFFER_SIZE   2      // Consecutive matches needed to lock
 
-#define NUM_OCTAVE_BANDS   10
+#define NUM_OCTAVE_BANDS   11
+// Band boundaries chosen so A1 (55 Hz) has its own band (27–65 Hz),
+// separate from D2 (73 Hz) which falls in the next band (65–130 Hz).
+// Previously the first band was 50–100 Hz, which put A1 and D2 together:
+// D2 was louder → noise gate zeroed A1's fundamental → HPS locked on D2.
 static const float OCTAVE_BANDS[NUM_OCTAVE_BANDS] = {
-    50, 100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600
+    27, 65, 130, 260, 520, 1040, 2080, 4160, 8320, 16640, 25600
 };
 
 // ==========================================================================

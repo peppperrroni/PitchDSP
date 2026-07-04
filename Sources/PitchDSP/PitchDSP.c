@@ -54,7 +54,7 @@
 //          ▼
 //   ┌─────────────────────┐
 //   │ Peak → Note + Cents │  argmax → Hz → MIDI → cents.
-//   │ + Note Buffer       │  2-deep stability filter.
+//   │ + Note Buffer       │  Runtime-configurable stability filter.
 //   └─────────────────────┘
 
 #include "PitchDSP.h"
@@ -63,16 +63,13 @@
 #include <string.h>
 
 // ==========================================================================
-//  Configuration (matching reference implementation)
+//  Configuration
 // ==========================================================================
 
-#define NUM_HPS            5       // Number of harmonic product spectrums
-#define POWER_THRESH       1e-6f   // Minimum signal power to activate
-#define WHITE_NOISE_THRESH 0.2f    // Octave-band noise gate fraction
-#define MAINS_HUM_FREQ     27.0f  // Zero all bins below this frequency (A0 = 27.5 Hz; was 62 Hz which wrongly killed A1 = 55 Hz)
-#define CONCERT_PITCH      440.0f // A4 reference
-#define HOP_DIVISOR        4      // Analyze every window/4 samples
-#define NOTE_BUFFER_SIZE   2      // Consecutive matches needed to lock
+#define NUM_HPS              5       // Number of harmonic product spectrums
+#define CONCERT_PITCH        440.0f  // A4 reference
+#define HOP_DIVISOR          4       // Analyze every window/4 samples
+#define NOTE_BUFFER_MAX      8       // Maximum noteStability value
 
 #define NUM_OCTAVE_BANDS   11
 // Band boundaries chosen so A1 (55 Hz) has its own band (27–65 Hz),
@@ -164,6 +161,9 @@ struct PitchDetector {
     int   hopSize;
     float deltaFreq;      // sampleRate / fftSize
 
+    // Runtime configuration (updated atomically via pitchDetectorConfigure)
+    PitchDetectorConfig config;
+
     // Ring buffer
     float *ringBuffer;
     int    ringCapacity;
@@ -179,8 +179,8 @@ struct PitchDetector {
     float *magSpecInterp;  // [halfFFT * NUM_HPS]
     float *hpsSpec;        // [halfFFT * NUM_HPS]
 
-    // Note stability (2-deep buffer, matching reference)
-    int    noteBuffer[NOTE_BUFFER_SIZE];
+    // Note stability (max-size fixed array, runtime limit = config.noteStability)
+    int    noteBuffer[NOTE_BUFFER_MAX];
     float  smoothedCents;
 
     // Output
@@ -191,8 +191,21 @@ struct PitchDetector {
 //  Public API
 // ==========================================================================
 
-PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate) {
+PitchDetectorConfig pitchDetectorDefaultConfig(void) {
+    PitchDetectorConfig cfg;
+    cfg.powerThreshold     = 1e-5f;  // ~-50 dBFS — cuts off body resonances during string decay
+    cfg.mainsHumFreq       = 27.0f;  // just below A0 (27.5 Hz), the lowest note we detect
+    cfg.noiseGateThreshold = 0.2f;   // fraction of band RMS
+    cfg.noteStability      = 2;      // consecutive DSP frames required to lock
+    return cfg;
+}
+
+PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetectorConfig config) {
     if (windowSize < 64 || sampleRate <= 0.0f) return NULL;
+
+    // Clamp noteStability to valid range
+    if (config.noteStability < 1) config.noteStability = 1;
+    if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
 
     PitchDetector *d = (PitchDetector *)calloc(1, sizeof(PitchDetector));
     if (!d) return NULL;
@@ -203,6 +216,7 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate) {
     d->deltaFreq  = sampleRate / (float)d->fftSize;
     d->hopSize    = d->fftSize / HOP_DIVISOR;
     if (d->hopSize < 1) d->hopSize = 1;
+    d->config     = config;
 
     // Ring buffer (2× window for safe circular access)
     d->ringCapacity = d->fftSize * 2;
@@ -233,13 +247,20 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate) {
     }
 
     // Initialize note buffer to invalid
-    for (int i = 0; i < NOTE_BUFFER_SIZE; i++)
+    for (int i = 0; i < NOTE_BUFFER_MAX; i++)
         d->noteBuffer[i] = -1;
 
     d->result.hz   = -1.0f;
     d->result.midi = -1;
 
     return d;
+}
+
+void pitchDetectorConfigure(PitchDetector *d, PitchDetectorConfig config) {
+    if (!d) return;
+    if (config.noteStability < 1) config.noteStability = 1;
+    if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
+    d->config = config;
 }
 
 void pitchDetectorDestroy(PitchDetector *d) {
@@ -301,13 +322,13 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     }
     power /= (float)d->fftSize;
 
-    if (power < POWER_THRESH) {
+    if (power < d->config.powerThreshold) {
         d->result.hz         = -1.0f;
         d->result.cents      =  0.0f;
         d->result.midi       = -1;
         d->result.confidence =  0.0f;
         d->result.stability  =  0.0f;
-        for (int i = 0; i < NOTE_BUFFER_SIZE; i++)
+        for (int i = 0; i < NOTE_BUFFER_MAX; i++)
             d->noteBuffer[i] = -1;
         d->smoothedCents = 0.0f;
         return;
@@ -340,10 +361,10 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     }
 
     // =================================================================
-    //  7. Mains hum suppression — zero bins below 62 Hz
+    //  7. Mains hum suppression — zero bins below config.mainsHumFreq
     // =================================================================
 
-    int humBins = (int)(MAINS_HUM_FREQ / d->deltaFreq);
+    int humBins = (int)(d->config.mainsHumFreq / d->deltaFreq);
     if (humBins > d->halfFFT) humBins = d->halfFFT;
     for (int i = 0; i < humBins; i++)
         d->magnitudeSpec[i] = 0.0f;
@@ -367,7 +388,7 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
         float rmsEnergy = sqrtf(sumSq / (float)bandSize);
 
         // Gate: zero bins below threshold
-        float thresh = WHITE_NOISE_THRESH * rmsEnergy;
+        float thresh = d->config.noiseGateThreshold * rmsEnergy;
         for (int i = iStart; i < iEnd; i++) {
             if (d->magnitudeSpec[i] < thresh)
                 d->magnitudeSpec[i] = 0.0f;
@@ -459,18 +480,20 @@ void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
     float cents = compute_cents(maxFreq, midi);
 
     // =================================================================
-    //  13. Note stability — 2-deep buffer (matching reference)
-    //      Same note must appear in 2 consecutive analyses to lock.
+    //  13. Note stability — runtime-configurable buffer
+    //      Same note must appear in config.noteStability consecutive
+    //      analyses before the result is updated.
     // =================================================================
 
-    // Shift buffer
-    for (int i = NOTE_BUFFER_SIZE - 1; i > 0; i--)
+    // Shift buffer (only use the first noteStability slots)
+    int stability = d->config.noteStability;
+    for (int i = stability - 1; i > 0; i--)
         d->noteBuffer[i] = d->noteBuffer[i - 1];
     d->noteBuffer[0] = midi;
 
-    // Check if all entries match
+    // Check if all active entries match
     int stable = 1;
-    for (int i = 1; i < NOTE_BUFFER_SIZE; i++) {
+    for (int i = 1; i < stability; i++) {
         if (d->noteBuffer[i] != d->noteBuffer[0]) {
             stable = 0;
             break;

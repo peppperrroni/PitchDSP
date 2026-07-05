@@ -10,10 +10,12 @@
 //   period estimate. Parabolic interpolation refines sub-sample accuracy.
 //
 // NOTE on candidate quality: YIN returns a plausible period candidate, not
-// a guaranteed fundamental. Wound strings and instruments with strong upper
-// harmonics can produce lower CMNDF values at a harmonic (shorter period /
-// higher frequency) than at the true fundamental. A post-YIN correction step
-// checks period × 2..8 for a better-scoring longer period (lower fundamental).
+// a guaranteed fundamental. Sub-harmonic locking can occur where YIN finds a
+// longer period (lower frequency) than the true fundamental because its CMNDF
+// dip is marginally deeper (common on wound bass/guitar strings). A post-YIN
+// correction step checks period/2..period/5: if a shorter period's CMNDF is
+// within octaveTolerance of the current candidate's CMNDF, the shorter period
+// (higher frequency, truer fundamental) is preferred.
 // This is separate from the confidence model which gates on pit depth and
 // local contrast so that flat or noisy CMNDF regions are rejected.
 //
@@ -63,8 +65,8 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
         .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
         .yinThreshold      = 0.15f,   // primary CMNDF pit threshold
         .fallbackThreshold = 0.25f,   // accept global min if no pit found
-        .octaveTolerance   = 0.08f,   // harmonic correction: prefer period×N if
-                                      // CMNDF[period×N] ≤ CMNDF[period] + tolerance
+        .octaveTolerance   = 0.06f,   // harmonic correction: prefer period/N if
+                                      // CMNDF[period/N] < CMNDF[period] + tolerance
         .minConfidence     = 0.72f,   // gate: reject if depth+contrast confidence < this
         .hopDivisor        = 8,       // analysis rate = sampleRate / (windowSize/8)
     };
@@ -214,25 +216,29 @@ static int find_best_period_fallback(const float* cmndf, int H, float fallbackTh
     return (bestTau >= 0 && bestVal < fallbackThreshold) ? bestTau : -1;
 }
 
-// Harmonic correction: if YIN latches onto an upper harmonic (shorter period,
-// higher frequency) instead of the true fundamental, check period × 2..8 for
-// a longer period whose CMNDF is within octaveTolerance of the current best.
-// Uses a chain comparison so each step is evaluated relative to the previous
-// accepted candidate (allows multi-octave correction).
+// Harmonic correction: if YIN sub-harmonic-locks (finds a longer period /
+// lower frequency than the true fundamental), check period/2..period/5.
+// If a shorter period's CMNDF is within octaveTolerance of the detected
+// period's CMNDF, the shorter period (higher frequency, truer fundamental)
+// is preferred. Returns on the first qualifying sub-period (N=2 first),
+// so the smallest frequency jump is always tried before larger ones.
+//
+// Example: playing A2 (110 Hz, tau=437) but YIN finds tau=875 (A1, 55 Hz)
+// because CMNDF(875)=0.244 < CMNDF(437)=0.271. With tolerance=0.06:
+// threshold=0.244+0.06=0.304 > 0.271 → correct back to tau=437 (A2). ✓
+// For a clean A1 signal: CMNDF(875)=0.08, CMNDF(437)=0.16,
+// threshold=0.08+0.06=0.14 < 0.16 → no correction. ✓
 static int correct_harmonic_period(const float* cmndf, int period, int H, float tolerance) {
     if (tolerance <= 0.0f) return period;
-    int   best      = period;
-    float baseValue = cmndf[period];
-    for (int mul = 2; mul <= 8; mul++) {
-        int candidate = period * mul;
-        if (candidate > H) break;
-        float candidateValue = cmndf[candidate];
-        if (candidateValue <= baseValue + tolerance) {
-            best      = candidate;
-            baseValue = candidateValue;
+    float threshold = cmndf[period] + tolerance;
+    for (int N = 2; N <= 5; N++) {
+        int sub = period / N;
+        if (sub < 2) break;
+        if (sub <= H && cmndf[sub] < threshold) {
+            return sub;
         }
     }
-    return best;
+    return period;
 }
 
 // Local CMNDF contrast: average value in a ±12-sample window (excluding ±2
@@ -354,6 +360,19 @@ static void run_analysis(PitchDetector* d) {
     // Step 6 — Confidence gate: depth + local contrast
     float contrast   = local_contrast(d->cmndf, period, H);
     float confidence = compute_confidence(d->cmndf[period], contrast);
+
+    // Minimum contrast guard: a contrast below 0.03 means the CMNDF has no
+    // discernible pit relative to its neighbours — the region is flat/noisy.
+    // This filters spurious sub-bass frames (large tau, contrast≈0.02-0.04)
+    // that otherwise pass the confidence gate on pit depth alone.
+    if (contrast < 0.03f) {
+        invalidate_result(d);
+#if DEBUG_PITCH
+        printf("[DSP] rms=%.5f peak=%.5f | lowContrast rawTau=%d corrTau=%d cmndf=%.3f contrast=%.3f conf=%.3f\n",
+               rms, peak, rawPeriod, period, d->cmndf[period], contrast, confidence);
+#endif
+        return;
+    }
 
     if (confidence < d->config.minConfidence) {
         invalidate_result(d);

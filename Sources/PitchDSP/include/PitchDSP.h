@@ -57,12 +57,12 @@ typedef struct {
     /// global CMNDF minimum if it is below fallbackThreshold. Default: 0.25.
     float fallbackThreshold;
 
-    /// Harmonic correction tolerance. Default: 0.08.
-    /// After YIN finds period P, checks P×2, P×3, …, P×8. If CMNDF[P×N] is within
-    /// this tolerance of the current best CMNDF value, the longer period (lower
-    /// frequency = truer fundamental) is preferred. Corrects cases where a strong
-    /// upper harmonic produces a lower CMNDF dip than the true fundamental.
-    /// Set to 0.0 to disable. Raise (e.g. 0.12) if octave-up errors persist.
+    /// Harmonic correction tolerance. Default: 0.06.
+    /// After YIN finds period P, checks P/2, P/3, P/4, P/5. If CMNDF[P/N] is
+    /// within this tolerance of CMNDF[P], the shorter period (higher frequency =
+    /// truer fundamental) is preferred. Corrects sub-harmonic locking where wound
+    /// strings cause YIN to settle on a longer period than the true fundamental.
+    /// Set to 0.0 to disable. Lower (e.g. 0.04) if spurious octave-up jumps appear.
     float octaveTolerance;
 
     /// Minimum confidence to report a result. Default: 0.72.

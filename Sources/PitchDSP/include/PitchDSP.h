@@ -1,4 +1,4 @@
-// PitchDSP.h — Streaming pitch detector (YIN algorithm)
+// PitchDSP.h — Streaming pitch detector (YIN algorithm, direct method)
 //
 // Usage:
 //   PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
@@ -55,25 +55,20 @@ typedef struct {
 
     /// Fallback threshold — if no minimum is found below yinThreshold, accept the
     /// global CMNDF minimum if it is below fallbackThreshold. Default: 0.25.
-    /// Helps strings whose CMNDF minimum sits between yinThreshold and 0.25
-    /// (e.g. wound G string under a microphone).
     float fallbackThreshold;
 
-    /// Harmonic correction threshold. Default: 0.45.
-    /// After finding a period T, the detector checks if T/N (N = 2..5) has a
-    /// CMNDF value below this threshold. If so, it prefers the shorter period
-    /// (higher frequency = the true fundamental). Corrects the octave-down
-    /// error common on wound strings (e.g. G3 detected as G1).
-    /// Set to 0.0 to disable harmonic correction.
-    float harmonicCorrThreshold;
+    /// Harmonic correction tolerance. Default: 0.08.
+    /// After YIN finds period P, checks P×2, P×3, …, P×8. If CMNDF[P×N] is within
+    /// this tolerance of the current best CMNDF value, the longer period (lower
+    /// frequency = truer fundamental) is preferred. Corrects cases where a strong
+    /// upper harmonic produces a lower CMNDF dip than the true fundamental.
+    /// Set to 0.0 to disable. Raise (e.g. 0.12) if octave-up errors persist.
+    float octaveTolerance;
 
-    /// Minimum detectable frequency in Hz. Default: 25.0 Hz.
-    /// Limits the maximum lag searched: maxTau = sampleRate / minHz.
-    /// This excludes the near-halfWindow region (tau ≈ windowSize/2) where
-    /// circular autocorrelation produces anomalous low-CMNDF artifacts.
-    /// 25 Hz covers bass B0 (30.87 Hz) with headroom; increase for guitar-only
-    /// use (e.g. 65 Hz = low E2). Set to 0 to use the full halfWindow.
-    float minHz;
+    /// Minimum confidence to report a result. Default: 0.72.
+    /// Confidence = 0.75×(1−CMNDF) + 0.25×(localContrast×8), clamped 0..1.
+    /// Frames below this threshold are reported as invalid (hz = -1).
+    float minConfidence;
 
     /// Analysis rate = sampleRate / (windowSize / hopDivisor).
     /// Default: 8 → ~47fps at 48kHz with windowSize=8192.

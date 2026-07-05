@@ -1,21 +1,21 @@
-// PitchDSP.c — YIN pitch detector
+// PitchDSP.c — YIN pitch detector (direct difference method)
 //
 // ALGORITHM: YIN (de Cheveigné & Kawahara, 2002)
 // ================================================
-//   The squared difference function d(τ) = Σ(x[t] − x[t+τ])²
-//   expands to d(τ) = 2·(r(0) − r(τ)) where r is the autocorrelation.
-//   Autocorrelation is computed via FFT in O(n log n).
-//   The Cumulative Mean Normalized Difference Function (CMNDF) is:
-//     d'(0)=1,  d'(τ)= d(τ)·τ / Σ_{j=1}^{τ} d(j)
-//   The first pit below yinThreshold is found and its bottom is taken
-//   as the period estimate. Parabolic interpolation refines sub-sample.
+//   The squared difference function d(τ) = Σ_{i=0}^{N-τ-1} (x[i] − x[i+τ])²
+//   is computed directly — no FFT, no circular autocorrelation.
+//   The Cumulative Mean Normalized Difference Function (CMNDF) is then:
+//     d'(0)=1,  d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
+//   The first pit below yinThreshold is found and its bottom taken as the
+//   period estimate. Parabolic interpolation refines sub-sample accuracy.
 //
-// NOTE on octave safety: YIN tends to find the fundamental period, but
-// can detect harmonics (especially the 2nd/4th) when they are stronger
-// than the fundamental in the autocorrelation. Harmonic correction
-// (checking period × 2..5) is done in a higher layer. The raw DSP
-// result should be treated as "best YIN candidate", not a guaranteed
-// fundamental.
+// NOTE on candidate quality: YIN returns a plausible period candidate, not
+// a guaranteed fundamental. Wound strings and instruments with strong upper
+// harmonics can produce lower CMNDF values at a harmonic (shorter period /
+// higher frequency) than at the true fundamental. A post-YIN correction step
+// checks period × 2..8 for a better-scoring longer period (lower fundamental).
+// This is separate from the confidence model which gates on pit depth and
+// local contrast so that flat or noisy CMNDF regions are rejected.
 //
 // Set DEBUG_PITCH 1 to enable per-analysis console logging.
 #define DEBUG_PITCH 1
@@ -26,10 +26,6 @@
 #include <string.h>
 #if DEBUG_PITCH
 #include <stdio.h>
-#endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
 #endif
 
 // ==========================================================================
@@ -49,60 +45,13 @@ struct PitchDetector {
     int         samplesSinceAnalysis;
 
     // Analysis workspace (pre-allocated, reused each hop)
-    float*      window;     // windowSize: current analysis frame
-    float*      fftReal;    // windowSize: FFT workspace (real)
-    float*      fftImag;    // windowSize: FFT workspace (imag)
-    float*      cmndf;      // halfWindow+1: CMNDF values for lags 0..halfWindow
+    float*      window;  // windowSize samples: current analysis frame
+    float*      diff;    // halfWindow+1: YIN squared difference function d(τ)
+    float*      cmndf;   // halfWindow+1: CMNDF values for lags 0..halfWindow
 
     // Latest result (written by process, read by getResult)
     PitchResult result;
 };
-
-// ==========================================================================
-//  Iterative Cooley-Tukey radix-2 DIT FFT (in-place)
-// ==========================================================================
-
-static void bit_reverse_swap(float* re, float* im, int n) {
-    int j = 0;
-    for (int i = 1; i < n; i++) {
-        int bit = n >> 1;
-        while (j & bit) { j ^= bit; bit >>= 1; }
-        j ^= bit;
-        if (i < j) {
-            float tr = re[i]; re[i] = re[j]; re[j] = tr;
-            float ti = im[i]; im[i] = im[j]; im[j] = ti;
-        }
-    }
-}
-
-// sign = -1 → forward FFT, sign = +1 → inverse FFT (with 1/N normalisation)
-static void fft_inplace(float* re, float* im, int n, int sign) {
-    bit_reverse_swap(re, im, n);
-    for (int len = 2; len <= n; len <<= 1) {
-        float ang = sign * 2.0f * (float)M_PI / (float)len;
-        float wr = cosf(ang), wi = sinf(ang);
-        for (int i = 0; i < n; i += len) {
-            float cr = 1.0f, ci = 0.0f;
-            int half = len >> 1;
-            for (int j = 0; j < half; j++) {
-                int u = i + j, v = i + j + half;
-                float tr = cr * re[v] - ci * im[v];
-                float ti = cr * im[v] + ci * re[v];
-                re[v] = re[u] - tr;
-                im[v] = im[u] - ti;
-                re[u] += tr;
-                im[u] += ti;
-                float new_cr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = new_cr;
-            }
-        }
-    }
-    if (sign == 1) {
-        float inv = 1.0f / (float)n;
-        for (int i = 0; i < n; i++) { re[i] *= inv; im[i] *= inv; }
-    }
-}
 
 // ==========================================================================
 //  Default config
@@ -110,13 +59,14 @@ static void fft_inplace(float* re, float* im, int n, int sign) {
 
 PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     return (PitchDetectorConfig){
-        .powerThreshold       = 1e-5f,  // -50 dBFS RMS gate
-        .peakThreshold        = 0.005f, // 0.5% peak gate — stops decaying tail noise
-        .yinThreshold         = 0.15f,  // primary CMNDF threshold
-        .fallbackThreshold    = 0.25f,  // accept global min if no primary pit found
-        .harmonicCorrThreshold= 0.45f,  // correct octave-down errors (wound G string)
-        .minHz                = 25.0f,  // exclude sub-bass artifact taus near halfWindow
-        .hopDivisor           = 8,      // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
+        .powerThreshold    = 1e-5f,   // -50 dBFS RMS gate
+        .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
+        .yinThreshold      = 0.15f,   // primary CMNDF pit threshold
+        .fallbackThreshold = 0.25f,   // accept global min if no pit found
+        .octaveTolerance   = 0.08f,   // harmonic correction: prefer period×N if
+                                      // CMNDF[period×N] ≤ CMNDF[period] + tolerance
+        .minConfidence     = 0.72f,   // gate: reject if depth+contrast confidence < this
+        .hopDivisor        = 8,       // analysis rate = sampleRate / (windowSize/8)
     };
 }
 
@@ -138,11 +88,10 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
 
     d->ringBuffer = (float*)calloc((size_t)windowSize, sizeof(float));
     d->window     = (float*)calloc((size_t)windowSize, sizeof(float));
-    d->fftReal    = (float*)calloc((size_t)windowSize, sizeof(float));
-    d->fftImag    = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->diff       = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
     d->cmndf      = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
 
-    if (!d->ringBuffer || !d->window || !d->fftReal || !d->fftImag || !d->cmndf) {
+    if (!d->ringBuffer || !d->window || !d->diff || !d->cmndf) {
         pitchDetectorDestroy(d);
         return NULL;
     }
@@ -158,8 +107,7 @@ void pitchDetectorDestroy(PitchDetector* d) {
     if (!d) return;
     free(d->ringBuffer);
     free(d->window);
-    free(d->fftReal);
-    free(d->fftImag);
+    free(d->diff);
     free(d->cmndf);
     free(d);
 }
@@ -190,7 +138,7 @@ static void invalidate_result(PitchDetector* d) {
     d->result.sequence++;
 }
 
-// Measure RMS and peak of window. Fills *rms_out and *peak_out.
+// Measure RMS and peak of window.
 static void measure_signal(const float* window, int n, float* rms_out, float* peak_out) {
     float power = 0.0f, peak = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -203,23 +151,56 @@ static void measure_signal(const float* window, int n, float* rms_out, float* pe
     *peak_out = peak;
 }
 
+// Direct YIN squared difference function.
+// d(0) = 0; d(τ) = Σ_{i=0}^{N-τ-1} (x[i] − x[i+τ])²
+// Direct (non-FFT) computation: linear autocorrelation, no circular artifacts.
+static void compute_yin_difference(PitchDetector* d) {
+    const int N = d->windowSize;
+    const int H = d->halfWindow;
+
+    d->diff[0] = 0.0f;
+
+    for (int tau = 1; tau <= H; tau++) {
+        float sum = 0.0f;
+        const int limit = N - tau;
+        for (int i = 0; i < limit; i++) {
+            float delta = d->window[i] - d->window[i + tau];
+            sum += delta * delta;
+        }
+        d->diff[tau] = sum;
+    }
+}
+
+// CMNDF from diff[].
+// d'(0) = 1; d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
+static void compute_cmndf(PitchDetector* d) {
+    const int H = d->halfWindow;
+
+    float cumSum  = 0.0f;
+    d->cmndf[0] = 1.0f;
+
+    for (int tau = 1; tau <= H; tau++) {
+        cumSum += d->diff[tau];
+        d->cmndf[tau] = (cumSum > 0.0f)
+            ? d->diff[tau] * (float)tau / cumSum
+            : 1.0f;
+    }
+}
+
 // Find the first CMNDF pit whose minimum is below threshold.
-// "First pit" = enter below threshold, walk to the local minimum.
-// Returns the tau at the pit bottom, or -1 if none found.
+// Enters below threshold, walks to the local pit bottom, returns tau there.
+// Returns -1 if no qualifying pit found.
 static int find_yin_period(const float* cmndf, int H, float threshold) {
     for (int tau = 2; tau <= H; tau++) {
         if (cmndf[tau] < threshold) {
-            // Walk to the bottom of this pit
-            while (tau + 1 <= H && cmndf[tau + 1] < cmndf[tau]) {
-                tau++;
-            }
+            while (tau + 1 <= H && cmndf[tau + 1] < cmndf[tau]) tau++;
             return tau;
         }
     }
     return -1;
 }
 
-// Fallback: return the tau of the global CMNDF minimum if it is below
+// Fallback: return the tau of the global CMNDF minimum if below
 // fallbackThreshold. Used when no pit satisfies yinThreshold.
 static int find_best_period_fallback(const float* cmndf, int H, float fallbackThreshold) {
     int   bestTau = -1;
@@ -233,29 +214,78 @@ static int find_best_period_fallback(const float* cmndf, int H, float fallbackTh
     return (bestTau >= 0 && bestVal < fallbackThreshold) ? bestTau : -1;
 }
 
-// Harmonic correction: YIN can latch onto a sub-harmonic (period × N) when
-// the fundamental is weak relative to upper harmonics (common on the wound
-// G string where the 4th harmonic can dominate the autocorrelation).
-// Strategy: for each divisor N = 2..5, if cmndf[period/N] < threshold,
-// prefer the shorter period (higher pitch = true fundamental). We iterate
-// N ascending so that in case multiple sub-periods pass, we end up with the
-// shortest one (highest frequency) — period/5 is preferred over period/2.
-static int correct_harmonic_period(const float* cmndf, int period, int H, float threshold) {
-    if (threshold <= 0.0f) return period;   // correction disabled
-    int best = period;
-    for (int N = 2; N <= 5; N++) {
-        int sub = period / N;
-        if (sub < 2) break;
-        if (sub <= H && cmndf[sub] < threshold) {
-            best = sub;   // ascending N: overwrites with progressively shorter periods
+// Harmonic correction: if YIN latches onto an upper harmonic (shorter period,
+// higher frequency) instead of the true fundamental, check period × 2..8 for
+// a longer period whose CMNDF is within octaveTolerance of the current best.
+// Uses a chain comparison so each step is evaluated relative to the previous
+// accepted candidate (allows multi-octave correction).
+static int correct_harmonic_period(const float* cmndf, int period, int H, float tolerance) {
+    if (tolerance <= 0.0f) return period;
+    int   best      = period;
+    float baseValue = cmndf[period];
+    for (int mul = 2; mul <= 8; mul++) {
+        int candidate = period * mul;
+        if (candidate > H) break;
+        float candidateValue = cmndf[candidate];
+        if (candidateValue <= baseValue + tolerance) {
+            best      = candidate;
+            baseValue = candidateValue;
         }
     }
-    if (best != period) {
-        // Walk to the local CMNDF minimum near the corrected period
-        while (best > 2 && cmndf[best - 1] < cmndf[best]) best--;
-        while (best < H && cmndf[best + 1] < cmndf[best]) best++;
-    }
     return best;
+}
+
+// Local CMNDF contrast: average value in a ±12-sample window (excluding ±2
+// around the pit centre) minus the pit value. Positive = clear pit, negative
+// = flat/noisy region.
+static float local_contrast(const float* cmndf, int tau, int H) {
+    int left  = tau - 12; if (left  < 1) left  = 1;
+    int right = tau + 12; if (right > H) right = H;
+    float sum = 0.0f;
+    int   count = 0;
+    for (int i = left; i <= right; i++) {
+        if (abs(i - tau) <= 2) continue;
+        sum += cmndf[i];
+        count++;
+    }
+    if (count <= 0) return 0.0f;
+    return sum / (float)count - cmndf[tau];
+}
+
+static float clamp01(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
+// Confidence from pit depth and local contrast.
+// depthScore   = 1 − CMNDF(period)  — how deep the pit is
+// contrastScore = contrast × 8      — how distinct the pit is from neighbours
+// confidence  = 0.75·depth + 0.25·contrast
+static float compute_confidence(float cmndfValue, float contrast) {
+    float depthScore    = clamp01(1.0f - cmndfValue);
+    float contrastScore = clamp01(contrast * 8.0f);
+    return clamp01(depthScore * 0.75f + contrastScore * 0.25f);
+}
+
+// Parabolic interpolation around the CMNDF minimum for sub-sample precision.
+static float refine_period_parabolic(const float* cmndf, int period, int H) {
+    float alpha = (period > 1) ? cmndf[period - 1] : cmndf[period];
+    float beta  = cmndf[period];
+    float gamma = (period < H) ? cmndf[period + 1] : cmndf[period];
+
+    float denom   = 2.0f * (2.0f * beta - alpha - gamma);
+    float refined = (float)period;
+
+    if (fabsf(denom) > 1e-10f) {
+        float offset = (gamma - alpha) / denom;
+        if (offset >  0.5f) offset =  0.5f;
+        if (offset < -0.5f) offset = -0.5f;
+        refined += offset;
+    }
+
+    if (refined < 1.0f) refined = (float)period;
+    return refined;
 }
 
 // ==========================================================================
@@ -266,19 +296,7 @@ static void run_analysis(PitchDetector* d) {
     const int N = d->windowSize;
     const int H = d->halfWindow;
 
-    // Effective upper bound for lag search.
-    // Limiting to sampleRate/minHz excludes the near-halfWindow region where
-    // circular autocorrelation produces anomalously low CMNDF values (artifact
-    // of the non-zero-padded FFT). For minHz=25 Hz at 48kHz: maxTau=1920,
-    // well below halfWindow=4096 and above bass B0 (tau≈1555 at 48kHz).
-    const int maxTau = (d->config.minHz > 0.0f)
-        ? (int)(d->sampleRate / d->config.minHz)
-        : H;
-    const int searchH = (maxTau < H) ? maxTau : H;
-
     // Step 1 — DC removal
-    // A DC offset biases the difference function; removing it first gives
-    // a cleaner CMNDF, especially important for close-mic recordings.
     remove_dc(d->window, N);
 
     // Step 2 — RMS + peak gate
@@ -290,137 +308,73 @@ static void run_analysis(PitchDetector* d) {
         return;
     }
 
-    // Step 3 — Forward FFT of the window
-    for (int i = 0; i < N; i++) {
-        d->fftReal[i] = d->window[i];
-        d->fftImag[i] = 0.0f;
-    }
-    fft_inplace(d->fftReal, d->fftImag, N, -1);
+    // Step 3 — Direct YIN difference function + CMNDF
+    compute_yin_difference(d);
+    compute_cmndf(d);
 
-    // Step 4 — Power spectrum → autocorrelation via IFFT
-    // r(τ) = IFFT(|X[k]|²). Note: this is circular autocorrelation (no
-    // zero-padding). For large τ (low-frequency notes near B0) the circular
-    // wrap-around can introduce small errors; a future improvement would
-    // zero-pad to 2N. For guitar range (B2–E6) the effect is negligible.
-    for (int i = 0; i < N; i++) {
-        d->fftReal[i] = d->fftReal[i] * d->fftReal[i] + d->fftImag[i] * d->fftImag[i];
-        d->fftImag[i] = 0.0f;
-    }
-    fft_inplace(d->fftReal, d->fftImag, N, 1);
-
-    // Step 5 — CMNDF
-    // d(τ) = 2·(r(0) − r(τ));  d'(0) = 1;
-    // d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
-    float r0     = d->fftReal[0];
-    float cumSum = 0.0f;
-    d->cmndf[0]  = 1.0f;
-
-    for (int tau = 1; tau <= H; tau++) {
-        float diff = 2.0f * (r0 - d->fftReal[tau]);
-        if (diff < 0.0f) diff = 0.0f;   // numerical floor
-        cumSum += diff;
-        d->cmndf[tau] = (cumSum > 0.0f) ? (diff * (float)tau / cumSum) : 1.0f;
-    }
-
-    // Step 6 — Threshold search: first pit below yinThreshold, walk to bottom
-    // Use searchH (≤ halfWindow) to exclude near-boundary circular-autocorrelation
-    // artifacts. The CMNDF loop above computed all values up to H; we simply
-    // restrict the pit search to the valid frequency range.
-    int period = find_yin_period(d->cmndf, searchH, d->config.yinThreshold);
+    // Step 4 — Threshold search: first pit below yinThreshold, walk to bottom
+    int period = find_yin_period(d->cmndf, H, d->config.yinThreshold);
     int usedFallback = 0;
 
     // Fallback: global minimum if within fallbackThreshold
-    // (helps strings whose CMNDF minimum sits just above yinThreshold)
     if (period < 0) {
-        period = find_best_period_fallback(d->cmndf, searchH, d->config.fallbackThreshold);
+        period = find_best_period_fallback(d->cmndf, H, d->config.fallbackThreshold);
         usedFallback = (period >= 0);
     }
 
-    // Step 6.5 — Harmonic correction
-    // Fix octave-down errors: if period/N has a lower CMNDF below
-    // harmonicCorrThreshold, the true fundamental is N× higher.
-    if (period >= 0) {
-#if DEBUG_PITCH
-        {
-            printf("[DSP] harm-scan: period=%d(%.1fHz) cmndf=%.4f thr=%.3f |",
-                   period, d->sampleRate / (float)period,
-                   d->cmndf[period], d->config.harmonicCorrThreshold);
-            for (int N = 2; N <= 5; N++) {
-                int sub = period / N;
-                if (sub < 2) break;
-                if (sub <= searchH) {
-                    printf(" N=%d tau=%d(%.1fHz)=%.4f", N, sub,
-                           d->sampleRate / (float)sub, d->cmndf[sub]);
-                }
-            }
-            printf("\n");
-        }
-#endif
-        int corrected = correct_harmonic_period(d->cmndf, period, searchH,
-                                                d->config.harmonicCorrThreshold);
-#if DEBUG_PITCH
-        if (corrected != period) {
-            printf("[DSP] harmonic-correct: %d(%.1fHz)→%d(%.1fHz) cmndf %.3f→%.3f\n",
-                   period, d->sampleRate / (float)period,
-                   corrected, d->sampleRate / (float)corrected,
-                   d->cmndf[period], d->cmndf[corrected]);
-        }
-#endif
-        period = corrected;
-    }
-
-#if DEBUG_PITCH
-    // Always log global CMNDF minimum so we can see what YIN found even on failure
-    // (search limited to searchH to match the actual search range)
-    {
-        int   globalBestTau = -1;
-        float globalBestVal = 1.0f;
-        for (int t = 2; t <= searchH; t++) {
-            if (d->cmndf[t] < globalBestVal) {
-                globalBestVal = d->cmndf[t];
-                globalBestTau = t;
-            }
-        }
-        float globalHz = (globalBestTau > 0) ? d->sampleRate / (float)globalBestTau : -1.0f;
-        printf("[DSP] rms=%.5f peak=%.5f | globalMin tau=%d cmndf=%.4f hz=%.1f | period=%d fallback=%d\n",
-               rms, peak, globalBestTau, globalBestVal, globalHz, period, usedFallback);
-    }
-#endif
-
     if (period < 0) {
         invalidate_result(d);
+#if DEBUG_PITCH
+        {
+            int   gt = -1; float gv = 1.0f;
+            for (int t = 2; t <= H; t++) {
+                if (d->cmndf[t] < gv) { gv = d->cmndf[t]; gt = t; }
+            }
+            printf("[DSP] rms=%.5f peak=%.5f | INVALID globalMin tau=%d cmndf=%.4f hz=%.1f\n",
+                   rms, peak, gt, gv, gt > 0 ? d->sampleRate / (float)gt : -1.0f);
+        }
+#endif
         return;
     }
 
-    float beta = d->cmndf[period];  // CMNDF value at found period
+    // Step 5 — Harmonic correction: prefer longer period (lower fundamental)
+    // if its CMNDF is within octaveTolerance of the current best.
+    int rawPeriod = period;
+    period = correct_harmonic_period(d->cmndf, period, H, d->config.octaveTolerance);
 
-    // Step 7 — Parabolic interpolation for sub-sample precision
-    float alpha     = (period > 1) ? d->cmndf[period - 1] : beta;
-    float gamma     = (period < H) ? d->cmndf[period + 1] : beta;
-    float denom     = 2.0f * (2.0f * beta - alpha - gamma);
-    float tau_refined = (float)period;
-
-    if (fabsf(denom) > 1e-10f) {
-        float offset = (gamma - alpha) / denom;
-        if (offset >  0.5f) offset =  0.5f;
-        if (offset < -0.5f) offset = -0.5f;
-        tau_refined += offset;
+#if DEBUG_PITCH
+    if (period != rawPeriod) {
+        printf("[DSP] harmonic-correct: %d(%.1fHz)→%d(%.1fHz) cmndf %.3f→%.3f\n",
+               rawPeriod, d->sampleRate / (float)rawPeriod,
+               period,    d->sampleRate / (float)period,
+               d->cmndf[rawPeriod], d->cmndf[period]);
     }
-    if (tau_refined < 1.0f) tau_refined = (float)period;
+#endif
 
-    // Step 8 — Output
-    float hz         = d->sampleRate / tau_refined;
-    float confidence = 1.0f - beta;
-    if (confidence < 0.0f) confidence = 0.0f;
-    if (confidence > 1.0f) confidence = 1.0f;
+    // Step 6 — Confidence gate: depth + local contrast
+    float contrast   = local_contrast(d->cmndf, period, H);
+    float confidence = compute_confidence(d->cmndf[period], contrast);
+
+    if (confidence < d->config.minConfidence) {
+        invalidate_result(d);
+#if DEBUG_PITCH
+        printf("[DSP] rms=%.5f peak=%.5f | lowConf rawTau=%d corrTau=%d cmndf=%.3f contrast=%.3f conf=%.3f\n",
+               rms, peak, rawPeriod, period, d->cmndf[period], contrast, confidence);
+#endif
+        return;
+    }
+
+    // Step 7 — Parabolic interpolation on the corrected period
+    float tau_refined = refine_period_parabolic(d->cmndf, period, H);
+    float hz          = d->sampleRate / tau_refined;
 
     d->result.hz         = hz;
     d->result.confidence = confidence;
     d->result.sequence++;
 
 #if DEBUG_PITCH
-    printf("[DSP] tau=%d hz=%.2f cmndf=%.3f conf=%.3f rms=%.5f peak=%.5f\n",
-           period, hz, beta, confidence, rms, peak);
+    printf("[DSP] rawTau=%d corrTau=%d hz=%.2f cmndf=%.3f contrast=%.3f conf=%.3f rms=%.5f peak=%.5f fallback=%d\n",
+           rawPeriod, period, hz, d->cmndf[period], contrast, confidence, rms, peak, usedFallback);
 #endif
 }
 
@@ -443,7 +397,7 @@ void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
             d->samplesSinceAnalysis = 0;
 
             // Copy most recent N samples from ring buffer (chronological order)
-            int start = d->writePos;  // oldest sample after advancing
+            int start = d->writePos;
             for (int j = 0; j < N; j++) {
                 d->window[j] = d->ringBuffer[(start + j) % N];
             }

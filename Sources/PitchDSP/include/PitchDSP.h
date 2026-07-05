@@ -6,13 +6,9 @@
 //
 //   // In your audio callback (any chunk size):
 //   pitchDetectorProcess(d, micSamples, sampleCount);
-//
-//   // In your UI update loop:
-//   PitchResult r = pitchDetectorGetResult(d);
-//   if (r.sequence != lastSequence) {
-//       lastSequence = r.sequence;
-//       if (r.hz > 0) { /* r.hz is the fundamental in Hz */ }
-//   }
+//   PitchResult results[16];
+//   int n = pitchDetectorDrainResults(d, results, 16);
+//   for (int i = 0; i < n; i++) { /* results[i].hz > 0 = pitch */ }
 //
 //   pitchDetectorDestroy(d);
 
@@ -113,8 +109,20 @@ void pitchDetectorConfigure(PitchDetector* detector, PitchDetectorConfig config)
 /// Feed new audio samples into the detector (streaming, any chunk size).
 void pitchDetectorProcess(PitchDetector* detector, const float* samples, int count);
 
-/// Retrieve the latest pitch detection result (struct copy, safe from any thread).
+/// Retrieve the latest pitch detection result (struct copy). Same single-thread
+/// contract as pitchDetectorProcess — see THREADING note on
+/// pitchDetectorDrainResults.
 PitchResult pitchDetectorGetResult(PitchDetector* detector);
+
+/// Drain queued results, oldest first. Every analysis cycle queues one result,
+/// including invalid ones (hz = -1) — consumers use invalid frames for silence
+/// debouncing. Internal queue capacity is 16; when full, the oldest result is
+/// dropped. Returns the number of results written to `out` (0..maxCount).
+///
+/// THREADING: call pitchDetectorProcess / pitchDetectorDrainResults /
+/// pitchDetectorGetResult from a single thread (typically the audio callback
+/// thread). Cross-thread hand-off is the caller's responsibility.
+int pitchDetectorDrainResults(PitchDetector* detector, PitchResult* out, int maxCount);
 
 #ifdef __cplusplus
 }

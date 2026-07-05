@@ -97,17 +97,16 @@ static RunResult run_detector(const float* samples, int n,
     PitchDetector* det = pitchDetectorCreate(8192, sr, cfg);
     RunResult result;
     memset(&result, 0, sizeof(result));
-    uint32_t last_seq = 0;
     const int chunk = 512;
 
     for (int i = 0; i < n && result.count < MAX_FRAMES; i += chunk) {
         int sz = (i + chunk <= n) ? chunk : (n - i);
         pitchDetectorProcess(det, samples + i, sz);
-        PitchResult r = pitchDetectorGetResult(det);
-        if (r.sequence != last_seq) {
-            last_seq = r.sequence;
-            result.frames[result.count].hz         = r.hz;
-            result.frames[result.count].confidence = r.confidence;
+        PitchResult drained[16];
+        int nd = pitchDetectorDrainResults(det, drained, 16);
+        for (int k = 0; k < nd && result.count < MAX_FRAMES; k++) {
+            result.frames[result.count].hz         = drained[k].hz;
+            result.frames[result.count].confidence = drained[k].confidence;
             result.count++;
         }
     }
@@ -382,6 +381,70 @@ static void test_yin_octave_safety(void) {
 }
 
 // ==========================================================================
+//  Suite 0: API — drain semantics
+// ==========================================================================
+
+static void test_drain_delivers_every_analysis(void) {
+    BEGIN_TEST("api/drain_every_analysis");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    PitchDetector* det = pitchDetectorCreate(8192, 48000.0f, cfg);
+    // 8 hops of a strong 330 Hz tone → exactly 8 queued results
+    int hop = 8192 / cfg.hopDivisor;
+    float* s = gen_sine(330.0f, 48000.0f, hop * 8);
+    pitchDetectorProcess(det, s, hop * 8);
+    free(s);
+
+    PitchResult out[16];
+    int n = pitchDetectorDrainResults(det, out, 16);
+    EXPECT(n == 8, "expected 8 results, got %d", n);
+    // Sequences strictly increasing (oldest first)
+    for (int i = 1; i < n; i++) {
+        EXPECT(out[i].sequence == out[i-1].sequence + 1,
+               "sequence gap: %u then %u", out[i-1].sequence, out[i].sequence);
+    }
+    // Second drain: empty
+    EXPECT(pitchDetectorDrainResults(det, out, 16) == 0, "second drain not empty");
+    pitchDetectorDestroy(det);
+}
+
+static void test_drain_includes_invalid_frames(void) {
+    BEGIN_TEST("api/drain_includes_invalid");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    PitchDetector* det = pitchDetectorCreate(8192, 48000.0f, cfg);
+    // Silence fails the RMS/peak gate → invalid results must still be queued
+    int hop = 8192 / cfg.hopDivisor;
+    float* s = calloc((size_t)(hop * 4), sizeof(float));
+    pitchDetectorProcess(det, s, hop * 4);
+    free(s);
+
+    PitchResult out[16];
+    int n = pitchDetectorDrainResults(det, out, 16);
+    EXPECT(n == 4, "expected 4 invalid results, got %d", n);
+    for (int i = 0; i < n; i++) {
+        EXPECT(out[i].hz < 0.0f, "silence frame %d has hz=%.1f, want -1", i, out[i].hz);
+    }
+    pitchDetectorDestroy(det);
+}
+
+static void test_drain_overwrites_oldest(void) {
+    BEGIN_TEST("api/drain_overwrite_oldest");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    PitchDetector* det = pitchDetectorCreate(8192, 48000.0f, cfg);
+    // 24 hops without draining → FIFO (cap 16) keeps the NEWEST 16
+    int hop = 8192 / cfg.hopDivisor;
+    float* s = gen_sine(330.0f, 48000.0f, hop * 24);
+    pitchDetectorProcess(det, s, hop * 24);
+    free(s);
+
+    PitchResult out[32];
+    int n = pitchDetectorDrainResults(det, out, 32);
+    EXPECT(n == 16, "expected 16 (capacity), got %d", n);
+    EXPECT(out[n-1].sequence == 24, "newest sequence %u, want 24", out[n-1].sequence);
+    EXPECT(out[0].sequence == 9, "oldest kept sequence %u, want 9", out[0].sequence);
+    pitchDetectorDestroy(det);
+}
+
+// ==========================================================================
 //  Suite 2: Synthetic Corpus  (production config, 44100 Hz pure sines)
 // ==========================================================================
 
@@ -433,6 +496,13 @@ int main(int argc, char** argv) {
     char path[512];
 
     printf("=== PitchDSP Test Suite ===\n\n");
+
+    // ------------------------------------------------------------------
+    printf("Suite 0: API\n");
+    test_drain_delivers_every_analysis();
+    test_drain_includes_invalid_frames();
+    test_drain_overwrites_oldest();
+    printf("\n");
 
     // ------------------------------------------------------------------
     printf("Suite 1: YIN Validation\n");

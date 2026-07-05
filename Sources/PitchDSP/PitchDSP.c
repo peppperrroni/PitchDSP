@@ -20,10 +20,13 @@
 // local contrast so that flat or noisy CMNDF regions are rejected.
 //
 // Set DEBUG_PITCH 1 to enable per-analysis console logging.
-// Can be overridden from the compiler command line: -DDEBUG_PITCH=0
+// Can be overridden from the compiler command line: -DDEBUG_PITCH=1
 #ifndef DEBUG_PITCH
-#define DEBUG_PITCH 1
+#define DEBUG_PITCH 0
 #endif
+
+// Capacity of the internal result queue drained by pitchDetectorDrainResults.
+#define PITCH_RESULT_FIFO 16
 
 #include "PitchDSP.h"
 #include <stdlib.h>
@@ -57,6 +60,12 @@ struct PitchDetector {
 
     // Latest result (written by process, read by getResult)
     PitchResult result;
+
+    // Result FIFO (drain API)
+    PitchResult fifo[PITCH_RESULT_FIFO];
+    int         fifoRead;
+    int         fifoWrite;
+    int         fifoCount;
 };
 
 // ==========================================================================
@@ -148,11 +157,24 @@ static void remove_dc(float* x, int n) {
     for (int i = 0; i < n; i++) x[i] -= mean;
 }
 
+// Queue a result (and mirror it as the "latest" for getResult).
+static void push_result(PitchDetector* d, float hz, float confidence) {
+    d->result.hz         = hz;
+    d->result.confidence = confidence;
+    d->result.sequence++;
+
+    if (d->fifoCount == PITCH_RESULT_FIFO) {
+        d->fifoRead = (d->fifoRead + 1) % PITCH_RESULT_FIFO;   // drop oldest
+        d->fifoCount--;
+    }
+    d->fifo[d->fifoWrite] = d->result;
+    d->fifoWrite = (d->fifoWrite + 1) % PITCH_RESULT_FIFO;
+    d->fifoCount++;
+}
+
 // Write invalid result and increment sequence.
 static void invalidate_result(PitchDetector* d) {
-    d->result.hz         = -1.0f;
-    d->result.confidence = 0.0f;
-    d->result.sequence++;
+    push_result(d, -1.0f, 0.0f);
 }
 
 // Measure RMS and peak of window.
@@ -452,9 +474,7 @@ static void run_analysis(PitchDetector* d) {
     float tau_refined = refine_period_parabolic(d->cmndf, period, H);
     float hz          = d->sampleRate / tau_refined;
 
-    d->result.hz         = hz;
-    d->result.confidence = confidence;
-    d->result.sequence++;
+    push_result(d, hz, confidence);
 
 #if DEBUG_PITCH
     printf("[DSP] rawTau=%d corrTau=%d hz=%.2f cmndf=%.3f contrast=%.3f conf=%.3f rms=%.5f peak=%.5f fallback=%d\n",
@@ -500,4 +520,19 @@ PitchResult pitchDetectorGetResult(PitchDetector* d) {
         return (PitchResult){ .hz = -1.0f, .confidence = 0.0f, .sequence = 0 };
     }
     return d->result;
+}
+
+// ==========================================================================
+//  DrainResults (single-thread with process; see header)
+// ==========================================================================
+
+int pitchDetectorDrainResults(PitchDetector* d, PitchResult* out, int maxCount) {
+    if (!d || !out || maxCount <= 0) return 0;
+    int n = 0;
+    while (n < maxCount && d->fifoCount > 0) {
+        out[n++] = d->fifo[d->fifoRead];
+        d->fifoRead = (d->fifoRead + 1) % PITCH_RESULT_FIFO;
+        d->fifoCount--;
+    }
+    return n;
 }

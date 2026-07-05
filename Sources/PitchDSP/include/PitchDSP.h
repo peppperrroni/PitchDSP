@@ -67,6 +67,14 @@ typedef struct {
     /// Set to 0.0 to disable harmonic correction.
     float harmonicCorrThreshold;
 
+    /// Minimum detectable frequency in Hz. Default: 25.0 Hz.
+    /// Limits the maximum lag searched: maxTau = sampleRate / minHz.
+    /// This excludes the near-halfWindow region (tau ≈ windowSize/2) where
+    /// circular autocorrelation produces anomalous low-CMNDF artifacts.
+    /// 25 Hz covers bass B0 (30.87 Hz) with headroom; increase for guitar-only
+    /// use (e.g. 65 Hz = low E2). Set to 0 to use the full halfWindow.
+    float minHz;
+
     /// Analysis rate = sampleRate / (windowSize / hopDivisor).
     /// Default: 8 → ~47fps at 48kHz with windowSize=8192.
     int   hopDivisor;

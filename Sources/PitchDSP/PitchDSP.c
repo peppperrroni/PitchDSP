@@ -115,6 +115,7 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
         .yinThreshold         = 0.15f,  // primary CMNDF threshold
         .fallbackThreshold    = 0.25f,  // accept global min if no primary pit found
         .harmonicCorrThreshold= 0.45f,  // correct octave-down errors (wound G string)
+        .minHz                = 25.0f,  // exclude sub-bass artifact taus near halfWindow
         .hopDivisor           = 8,      // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
     };
 }
@@ -265,6 +266,16 @@ static void run_analysis(PitchDetector* d) {
     const int N = d->windowSize;
     const int H = d->halfWindow;
 
+    // Effective upper bound for lag search.
+    // Limiting to sampleRate/minHz excludes the near-halfWindow region where
+    // circular autocorrelation produces anomalously low CMNDF values (artifact
+    // of the non-zero-padded FFT). For minHz=25 Hz at 48kHz: maxTau=1920,
+    // well below halfWindow=4096 and above bass B0 (tau≈1555 at 48kHz).
+    const int maxTau = (d->config.minHz > 0.0f)
+        ? (int)(d->sampleRate / d->config.minHz)
+        : H;
+    const int searchH = (maxTau < H) ? maxTau : H;
+
     // Step 1 — DC removal
     // A DC offset biases the difference function; removing it first gives
     // a cleaner CMNDF, especially important for close-mic recordings.
@@ -312,13 +323,16 @@ static void run_analysis(PitchDetector* d) {
     }
 
     // Step 6 — Threshold search: first pit below yinThreshold, walk to bottom
-    int period = find_yin_period(d->cmndf, H, d->config.yinThreshold);
+    // Use searchH (≤ halfWindow) to exclude near-boundary circular-autocorrelation
+    // artifacts. The CMNDF loop above computed all values up to H; we simply
+    // restrict the pit search to the valid frequency range.
+    int period = find_yin_period(d->cmndf, searchH, d->config.yinThreshold);
     int usedFallback = 0;
 
     // Fallback: global minimum if within fallbackThreshold
     // (helps strings whose CMNDF minimum sits just above yinThreshold)
     if (period < 0) {
-        period = find_best_period_fallback(d->cmndf, H, d->config.fallbackThreshold);
+        period = find_best_period_fallback(d->cmndf, searchH, d->config.fallbackThreshold);
         usedFallback = (period >= 0);
     }
 
@@ -326,7 +340,7 @@ static void run_analysis(PitchDetector* d) {
     // Fix octave-down errors: if period/N has a lower CMNDF below
     // harmonicCorrThreshold, the true fundamental is N× higher.
     if (period >= 0) {
-        int corrected = correct_harmonic_period(d->cmndf, period, H,
+        int corrected = correct_harmonic_period(d->cmndf, period, searchH,
                                                 d->config.harmonicCorrThreshold);
 #if DEBUG_PITCH
         if (corrected != period) {
@@ -341,10 +355,11 @@ static void run_analysis(PitchDetector* d) {
 
 #if DEBUG_PITCH
     // Always log global CMNDF minimum so we can see what YIN found even on failure
+    // (search limited to searchH to match the actual search range)
     {
         int   globalBestTau = -1;
         float globalBestVal = 1.0f;
-        for (int t = 2; t <= H; t++) {
+        for (int t = 2; t <= searchH; t++) {
             if (d->cmndf[t] < globalBestVal) {
                 globalBestVal = d->cmndf[t];
                 globalBestTau = t;

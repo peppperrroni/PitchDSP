@@ -340,6 +340,22 @@ static void run_analysis(PitchDetector* d) {
     // Fix octave-down errors: if period/N has a lower CMNDF below
     // harmonicCorrThreshold, the true fundamental is N× higher.
     if (period >= 0) {
+#if DEBUG_PITCH
+        {
+            printf("[DSP] harm-scan: period=%d(%.1fHz) cmndf=%.4f thr=%.3f |",
+                   period, d->sampleRate / (float)period,
+                   d->cmndf[period], d->config.harmonicCorrThreshold);
+            for (int N = 2; N <= 5; N++) {
+                int sub = period / N;
+                if (sub < 2) break;
+                if (sub <= searchH) {
+                    printf(" N=%d tau=%d(%.1fHz)=%.4f", N, sub,
+                           d->sampleRate / (float)sub, d->cmndf[sub]);
+                }
+            }
+            printf("\n");
+        }
+#endif
         int corrected = correct_harmonic_period(d->cmndf, period, searchH,
                                                 d->config.harmonicCorrThreshold);
 #if DEBUG_PITCH

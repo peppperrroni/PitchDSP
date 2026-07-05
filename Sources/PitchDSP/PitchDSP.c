@@ -20,7 +20,10 @@
 // local contrast so that flat or noisy CMNDF regions are rejected.
 //
 // Set DEBUG_PITCH 1 to enable per-analysis console logging.
+// Can be overridden from the compiler command line: -DDEBUG_PITCH=0
+#ifndef DEBUG_PITCH
 #define DEBUG_PITCH 1
+#endif
 
 #include "PitchDSP.h"
 #include <stdlib.h>
@@ -265,6 +268,45 @@ static int correct_harmonic_period(const float* cmndf, int period, int maxTau, f
     return period;
 }
 
+// Sub-fundamental correction: if YIN over-locked on a harmonic (finds a shorter
+// period / higher frequency than the true fundamental), check period*2.
+// If the doubled period has a CMNDF pit both below yinThreshold AND deeper than
+// the current pit, the doubled period (lower frequency, true fundamental) is
+// preferred.
+//
+// Physics: for a wound string whose 2nd harmonic dominates the spectrum, the
+// CMNDF has a pit at T/2 (the harmonic period) that YIN finds first. But the
+// true fundamental period T also has a pit — and typically a deeper one — because
+// all harmonics align at T. The condition cmndf[2τ] < cmndf[τ] captures this.
+//
+// This correction is complementary to correct_harmonic_period (which corrects
+// sub-harmonic locks: too-low detections). These two are never run together —
+// only the sub-fundamental runs when the octave-up correction did not fire.
+//
+// Guard: period*2 must stay within maxTau (valid detection range).
+static int correct_sub_harmonic_period(const float* cmndf, int period, int maxTau, float threshold) {
+    int doubled = period * 2;
+    if (doubled > maxTau) return period;
+    // Mirror of the harmonic-correction guard: only fire for the upper third of the
+    // valid period range (i.e., short periods = high detected frequencies). A long
+    // period already represents a low note — doubling it pushes into sub-bass and is
+    // almost certainly wrong (CMNDF bias at large τ can make cmndf[2τ] < cmndf[τ]
+    // spuriously). The upper-third guard matches the harmonic correction's lower-third
+    // guard so the two corrections are strictly complementary.
+    // Pure-sine guard: if the current pit is very deep, all multiples also dip near
+    // zero. The frequency-range guard subsumes this case for bass, but keep the deep-
+    // pit guard as a second line of defence for mid-range pure signals.
+    if (period > maxTau / 3) return period;
+    if (cmndf[period] < 0.05f) return period;
+    // Require the sub-fundamental pit to be meaningfully deeper (not just marginally),
+    // so that a genuine fundamental with a slightly noisy CMNDF is not mis-doubled.
+    // 0.02 margin: the difference between A2 cmndf≈0.055 and A1 cmndf≈0.060 is ~0.005,
+    // below the margin → no spurious doubling. Wound-string cases (G3: 0.12 vs 0.04)
+    // have a difference of ~0.08, well above the margin → correction still fires.
+    if (cmndf[doubled] < threshold && cmndf[doubled] < cmndf[period] - 0.02f) return doubled;
+    return period;
+}
+
 // Local CMNDF contrast: average value in a ±12-sample window (excluding ±2
 // around the pit centre) minus the pit value. Positive = clear pit, negative
 // = flat/noisy region.
@@ -375,6 +417,14 @@ static void run_analysis(PitchDetector* d) {
     // period. Guard prevents correction for notes already in the upper range.
     int rawPeriod = period;
     period = correct_harmonic_period(d->cmndf, period, MT, d->config.octaveTolerance);
+
+    // Step 5b — Sub-fundamental correction: if the octave-up correction did not
+    // fire, check whether period*2 is a deeper pit (wound-string over-harmonic lock).
+    // The two corrections are mutually exclusive: a period cannot be both too long
+    // and too short simultaneously.
+    if (period == rawPeriod) {
+        period = correct_sub_harmonic_period(d->cmndf, period, MT, d->config.yinThreshold);
+    }
 
 #if DEBUG_PITCH
     if (period != rawPeriod) {

@@ -28,6 +28,10 @@
 // Capacity of the internal result queue drained by pitchDetectorDrainResults.
 #define PITCH_RESULT_FIFO 16
 
+// Decimation parameters
+#define PITCH_DECIM_FACTOR 4
+#define PITCH_FIR_TAPS     47
+
 #include "PitchDSP.h"
 #include <stdlib.h>
 #include <math.h>
@@ -58,6 +62,16 @@ struct PitchDetector {
     float*      window;  // windowSize samples: current analysis frame
     float*      diff;    // halfWindow+1: YIN squared difference function d(τ)
     float*      cmndf;   // halfWindow+1: CMNDF values for lags 0..halfWindow
+
+    // Decimation (coarse-stage input): anti-alias FIR + keep every 4th sample
+    float       firCoef[PITCH_FIR_TAPS];
+    float       firHist[PITCH_FIR_TAPS];
+    int         firHistPos;
+    int         decimPhase;
+    float*      decRing;         // decimated ring, decWindowSize entries
+    int         decWritePos;
+    int         decWindowSize;   // windowSize / PITCH_DECIM_FACTOR
+    float       decRate;         // sampleRate / PITCH_DECIM_FACTOR
 
     // Latest result (written by process, read by getResult)
     PitchResult result;
@@ -107,9 +121,32 @@ static int compute_min_tau(float sampleRate, float maxHz) {
     return (mt < 2) ? 2 : mt;
 }
 
+// Hamming-windowed sinc low-pass, unity DC gain.
+// fcNorm = cutoff / inputSampleRate. With 47 taps and fcNorm 0.085 the stopband
+// begins near 0.12×fs — just inside the post-decimation Nyquist (0.125×fs) —
+// giving ≥ ~50 dB alias rejection while passing fundamentals + low harmonics
+// (flat to ~2.3 kHz at 48 kHz input).
+static void build_fir_lowpass(float* h, int taps, float fcNorm) {
+    int M = taps - 1;
+    float sum = 0.0f;
+    for (int i = 0; i < taps; i++) {
+        float x = (float)i - (float)M / 2.0f;
+        float sinc = (fabsf(x) < 1e-6f)
+            ? 2.0f * fcNorm
+            : sinf(2.0f * (float)M_PI * fcNorm * x) / ((float)M_PI * x);
+        float w = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * (float)i / (float)M);
+        h[i] = sinc * w;
+        sum += h[i];
+    }
+    for (int i = 0; i < taps; i++) h[i] /= sum;
+}
+
 PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetectorConfig config) {
     PitchDetector* d = (PitchDetector*)calloc(1, sizeof(PitchDetector));
     if (!d) return NULL;
+
+    // Reject window sizes not divisible by decimation factor
+    if (windowSize <= 0 || (windowSize % PITCH_DECIM_FACTOR) != 0) { free(d); return NULL; }
 
     int divisor = (config.hopDivisor > 0) ? config.hopDivisor : 8;
 
@@ -126,10 +163,18 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
     d->diff       = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
     d->cmndf      = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
 
-    if (!d->ringBuffer || !d->window || !d->diff || !d->cmndf) {
+    // Decimation state
+    d->decWindowSize = windowSize / PITCH_DECIM_FACTOR;
+    d->decRate       = sampleRate / (float)PITCH_DECIM_FACTOR;
+    d->decRing       = (float*)calloc((size_t)d->decWindowSize, sizeof(float));
+
+    if (!d->ringBuffer || !d->window || !d->diff || !d->cmndf || !d->decRing) {
         pitchDetectorDestroy(d);
         return NULL;
     }
+
+    // Build FIR coefficients
+    build_fir_lowpass(d->firCoef, PITCH_FIR_TAPS, 0.085f);
 
     d->result.hz         = -1.0f;
     d->result.confidence = 0.0f;
@@ -144,6 +189,7 @@ void pitchDetectorDestroy(PitchDetector* d) {
     free(d->window);
     free(d->diff);
     free(d->cmndf);
+    free(d->decRing);
     free(d);
 }
 
@@ -515,6 +561,20 @@ void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
         d->ringBuffer[d->writePos] = samples[i];
         d->writePos = (d->writePos + 1) % N;
         d->samplesSinceAnalysis++;
+
+        // Feed FIR and decimate
+        d->firHist[d->firHistPos] = samples[i];
+        d->firHistPos = (d->firHistPos + 1) % PITCH_FIR_TAPS;
+        if (++d->decimPhase == PITCH_DECIM_FACTOR) {
+            d->decimPhase = 0;
+            float acc = 0.0f;
+            int idx = d->firHistPos;   // oldest sample position
+            for (int k = 0; k < PITCH_FIR_TAPS; k++) {
+                acc += d->firCoef[k] * d->firHist[(idx + k) % PITCH_FIR_TAPS];
+            }
+            d->decRing[d->decWritePos] = acc;
+            d->decWritePos = (d->decWritePos + 1) % d->decWindowSize;
+        }
 
         if (d->samplesSinceAnalysis >= HS) {
             d->samplesSinceAnalysis = 0;

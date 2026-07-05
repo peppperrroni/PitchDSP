@@ -389,19 +389,6 @@ static void run_analysis(PitchDetector* d) {
     float contrast   = local_contrast(d->cmndf, period, H);
     float confidence = compute_confidence(d->cmndf[period], contrast);
 
-    // Minimum contrast guard: a contrast below 0.03 means the CMNDF has no
-    // discernible pit relative to its neighbours — the region is flat/noisy.
-    // This filters spurious sub-bass frames (large tau, contrast≈0.02-0.04)
-    // that otherwise pass the confidence gate on pit depth alone.
-    if (contrast < 0.03f) {
-        invalidate_result(d);
-#if DEBUG_PITCH
-        printf("[DSP] rms=%.5f peak=%.5f | lowContrast rawTau=%d corrTau=%d cmndf=%.3f contrast=%.3f conf=%.3f\n",
-               rms, peak, rawPeriod, period, d->cmndf[period], contrast, confidence);
-#endif
-        return;
-    }
-
     if (confidence < d->config.minConfidence) {
         invalidate_result(d);
 #if DEBUG_PITCH

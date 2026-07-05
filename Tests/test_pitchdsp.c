@@ -509,6 +509,43 @@ static void wav_test(const char* label, const char* path,
 }
 
 // ==========================================================================
+//  Suite 5: Cents accuracy sweep (two-stage refine)
+// ==========================================================================
+
+static void sweep_point(const char* label, float hz, float sr) {
+    BEGIN_TEST(label);
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    int n = 8192 * 20;
+    float* s = gen_sine(hz, sr, n);
+    RunResult r = run_detector(s, n, sr, cfg); free(s);
+
+    // Median cents error over the second half — robust to onset frames.
+    double errs[MAX_FRAMES]; int ne = 0;
+    for (int i = r.count / 2; i < r.count; i++) {
+        if (r.frames[i].hz <= 0.0f) continue;
+        errs[ne++] = cents_diff(r.frames[i].hz, hz);
+    }
+    if (ne == 0) { g_failed++; printf("  FAIL [%s]: no valid frames\n", label); return; }
+    // insertion sort (small ne)
+    for (int i = 1; i < ne; i++) {
+        double v = errs[i]; int j = i - 1;
+        while (j >= 0 && errs[j] > v) { errs[j+1] = errs[j]; j--; }
+        errs[j+1] = v;
+    }
+    double median = errs[ne / 2];
+    EXPECT(fabs(median) <= 2.0, "median cents error %.2f > 2.0 (hz=%.2f)", median, hz);
+}
+
+static void sweep_note(const char* name, float base, float sr) {
+    char label[64];
+    float lo = base * powf(2.0f, -30.0f / 1200.0f);
+    float hi = base * powf(2.0f,  30.0f / 1200.0f);
+    snprintf(label, sizeof(label), "sweep/%s_-30c", name); sweep_point(label, lo, sr);
+    snprintf(label, sizeof(label), "sweep/%s_+0c",  name); sweep_point(label, base, sr);
+    snprintf(label, sizeof(label), "sweep/%s_+30c", name); sweep_point(label, hi, sr);
+}
+
+// ==========================================================================
 //  main
 // ==========================================================================
 
@@ -586,6 +623,20 @@ int main(int argc, char** argv) {
     WAV48(guitar_E2, 82.407f);
     WAV48(guitar_G3, 196.000f);
 #undef WAV48
+
+    // ------------------------------------------------------------------
+    printf("\nSuite 5: Cents accuracy sweep (48000 Hz)\n");
+    sweep_note("B0",  30.868f, 48000.0f);
+    sweep_note("E1",  41.203f, 48000.0f);
+    sweep_note("A1",  55.000f, 48000.0f);
+    sweep_note("E2",  82.407f, 48000.0f);
+    sweep_note("A2", 110.000f, 48000.0f);
+    sweep_note("G3", 196.000f, 48000.0f);
+    sweep_note("E4", 329.628f, 48000.0f);
+    sweep_note("A4", 440.000f, 48000.0f);
+    printf("\nSuite 5b: Cents accuracy spot checks (44100 Hz)\n");
+    sweep_note("E2_44k",  82.407f, 44100.0f);
+    sweep_note("A4_44k", 440.000f, 44100.0f);
 
     // ------------------------------------------------------------------
     printf("\n=== Results: %d passed, %d failed, %d skipped ===\n",

@@ -50,8 +50,6 @@ struct PitchDetector {
     float       sampleRate;
     PitchDetectorConfig config;
     int         hopSize;
-    int         maxTau;   // sampleRate / minHz — upper bound for tau search
-    int         minTau;   // sampleRate / maxHz — lower bound for tau search
 
     // Ring buffer (circular audio accumulation)
     float*      ringBuffer;
@@ -59,9 +57,10 @@ struct PitchDetector {
     int         samplesSinceAnalysis;
 
     // Analysis workspace (pre-allocated, reused each hop)
-    float*      window;  // windowSize samples: current analysis frame
-    float*      diff;    // halfWindow+1: YIN squared difference function d(τ)
-    float*      cmndf;   // halfWindow+1: CMNDF values for lags 0..halfWindow
+    float*      window;     // windowSize samples: full-rate frame (gate + refine)
+    float*      decWindow;  // decWindowSize samples: decimated frame (coarse YIN input)
+    float*      diff;       // decWindowSize/2+1: YIN squared difference function d(τ) (decimated)
+    float*      cmndf;      // decWindowSize/2+1: CMNDF values (decimated)
 
     // Decimation (coarse-stage input): anti-alias FIR + keep every 4th sample
     float       firCoef[PITCH_FIR_TAPS];
@@ -72,6 +71,9 @@ struct PitchDetector {
     int         decWritePos;
     int         decWindowSize;   // windowSize / PITCH_DECIM_FACTOR
     float       decRate;         // sampleRate / PITCH_DECIM_FACTOR
+    int         maxTauD;         // decRate / minHz — upper bound for coarse tau search
+    int         minTauD;         // decRate / maxHz — lower bound for coarse tau search
+    int         maxTauPlusD;     // min(maxTauD + 1, decWindowSize / 2) — diff/cmndf loop bound
 
     // Latest result (written by process, read by getResult)
     PitchResult result;
@@ -155,20 +157,22 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
     d->sampleRate = sampleRate;
     d->config     = config;
     d->hopSize    = windowSize / divisor;
-    d->maxTau     = compute_max_tau(sampleRate, config.minHz, d->halfWindow);
-    d->minTau     = compute_min_tau(sampleRate, config.maxHz);
-
-    d->ringBuffer = (float*)calloc((size_t)windowSize, sizeof(float));
-    d->window     = (float*)calloc((size_t)windowSize, sizeof(float));
-    d->diff       = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
-    d->cmndf      = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
 
     // Decimation state
     d->decWindowSize = windowSize / PITCH_DECIM_FACTOR;
     d->decRate       = sampleRate / (float)PITCH_DECIM_FACTOR;
-    d->decRing       = (float*)calloc((size_t)d->decWindowSize, sizeof(float));
+    d->maxTauD       = compute_max_tau(d->decRate, config.minHz, d->decWindowSize / 2);
+    d->minTauD       = compute_min_tau(d->decRate, config.maxHz);
+    d->maxTauPlusD   = (d->maxTauD + 1 < d->decWindowSize / 2) ? d->maxTauD + 1 : d->decWindowSize / 2;
 
-    if (!d->ringBuffer || !d->window || !d->diff || !d->cmndf || !d->decRing) {
+    d->ringBuffer = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->window     = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->decWindow  = (float*)calloc((size_t)d->decWindowSize, sizeof(float));
+    d->diff       = (float*)calloc((size_t)(d->decWindowSize / 2 + 1), sizeof(float));
+    d->cmndf      = (float*)calloc((size_t)(d->decWindowSize / 2 + 1), sizeof(float));
+    d->decRing    = (float*)calloc((size_t)d->decWindowSize, sizeof(float));
+
+    if (!d->ringBuffer || !d->window || !d->decWindow || !d->diff || !d->cmndf || !d->decRing) {
         pitchDetectorDestroy(d);
         return NULL;
     }
@@ -187,6 +191,7 @@ void pitchDetectorDestroy(PitchDetector* d) {
     if (!d) return;
     free(d->ringBuffer);
     free(d->window);
+    free(d->decWindow);
     free(d->diff);
     free(d->cmndf);
     free(d->decRing);
@@ -196,10 +201,11 @@ void pitchDetectorDestroy(PitchDetector* d) {
 void pitchDetectorConfigure(PitchDetector* d, PitchDetectorConfig config) {
     if (!d) return;
     int divisor = (config.hopDivisor > 0) ? config.hopDivisor : 8;
-    d->config  = config;
-    d->hopSize = d->windowSize / divisor;
-    d->maxTau  = compute_max_tau(d->sampleRate, config.minHz, d->halfWindow);
-    d->minTau  = compute_min_tau(d->sampleRate, config.maxHz);
+    d->config      = config;
+    d->hopSize     = d->windowSize / divisor;
+    d->maxTauD     = compute_max_tau(d->decRate, config.minHz, d->decWindowSize / 2);
+    d->minTauD     = compute_min_tau(d->decRate, config.maxHz);
+    d->maxTauPlusD = (d->maxTauD + 1 < d->decWindowSize / 2) ? d->maxTauD + 1 : d->decWindowSize / 2;
 }
 
 // ==========================================================================
@@ -247,14 +253,13 @@ static void measure_signal(const float* window, int n, float* rms_out, float* pe
     *peak_out = peak;
 }
 
-// Direct YIN squared difference function.
+// Direct YIN squared difference function, on the decimated (coarse-stage) window.
 // d(0) = 0; d(τ) = Σ_{i=0}^{N-τ-1} (x[i] − x[i+τ])²
 // Direct (non-FFT) computation: linear autocorrelation, no circular artifacts.
-// Computed only up to maxTau + 1 (parabolic neighbour for refinement).
+// Computed only up to maxTauD + 1 (parabolic neighbour for refinement).
 static void compute_yin_difference(PitchDetector* d) {
-    const int N = d->windowSize;
-    const int H = d->halfWindow;
-    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
+    const int N = d->decWindowSize;
+    const int maxTauPlus = d->maxTauPlusD;
 
     d->diff[0] = 0.0f;
 
@@ -262,19 +267,18 @@ static void compute_yin_difference(PitchDetector* d) {
         float sum = 0.0f;
         const int limit = N - tau;
         for (int i = 0; i < limit; i++) {
-            float delta = d->window[i] - d->window[i + tau];
+            float delta = d->decWindow[i] - d->decWindow[i + tau];
             sum += delta * delta;
         }
         d->diff[tau] = sum;
     }
 }
 
-// CMNDF from diff[].
+// CMNDF from diff[] (decimated domain).
 // d'(0) = 1; d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
-// Computed only up to maxTau + 1 (parabolic neighbour for refinement).
+// Computed only up to maxTauD + 1 (parabolic neighbour for refinement).
 static void compute_cmndf(PitchDetector* d) {
-    const int H = d->halfWindow;
-    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
+    const int maxTauPlus = d->maxTauPlusD;
 
     float cumSum  = 0.0f;
     d->cmndf[0] = 1.0f;
@@ -336,6 +340,12 @@ static int find_best_period_fallback(const float* cmndf, int minTau, int maxTau,
 // For a clean A1 signal: CMNDF(875)=0.08, CMNDF(437)=0.16,
 // threshold=0.08+0.06=0.14 < 0.16 → no correction. ✓
 // For G3 (tau=225) with maxTau=1633: 225 ≤ 1633/3=544 → guard skips. ✓
+//
+// NOTE: since the two-stage rework, cmndf/period/minTau/maxTau here are all in
+// the decimated (coarse-stage) domain — the illustrative tau values above are
+// from the full sample rate and are ~PITCH_DECIM_FACTOR× larger than the
+// decimated tau this function actually sees. The period/N ratio logic and
+// tolerance comparisons are unaffected by the rate change.
 static int correct_harmonic_period(const float* cmndf, int period, int minTau, int maxTau, float tolerance) {
     if (tolerance <= 0.0f) return period;
     // Only correct when the note is in the lower third of the valid range.
@@ -423,25 +433,52 @@ static float compute_confidence(float cmndfValue, float contrast) {
     return clamp01(depthScore * 0.75f + contrastScore * 0.25f);
 }
 
-// Parabolic interpolation around the CMNDF minimum for sub-sample precision.
-// maxTauPlus bounds the neighbour lookup (== maxTau + 1 for valid parabolic access).
-static float refine_period_parabolic(const float* cmndf, int period, int maxTauPlus) {
-    float alpha = (period > 1) ? cmndf[period - 1] : cmndf[period];
-    float beta  = cmndf[period];
-    float gamma = (period < maxTauPlus) ? cmndf[period + 1] : cmndf[period];
+// ==========================================================================
+//  Full-rate refinement
+// ==========================================================================
 
-    float denom   = 2.0f * (2.0f * beta - alpha - gamma);
-    float refined = (float)period;
+// Full-rate refinement. The coarse stage found the period at the decimated
+// rate; the raw difference function d(τ) at the original rate has its
+// corresponding minimum near τ0 = period × PITCH_DECIM_FACTOR. We search a
+// ±(FACTOR+2) band and parabolically interpolate the raw d(τ) minimum — the
+// CMNDF normalization cannot be computed locally (it needs the cumulative sum
+// from τ=1) and is unnecessary for sub-sample placement of an isolated pit.
+static float refine_full_rate(PitchDetector* d, int decPeriod) {
+    const int N    = d->windowSize;
+    const int band = PITCH_DECIM_FACTOR + 2;
+    int tau0 = decPeriod * PITCH_DECIM_FACTOR;
+    int lo = tau0 - band, hi = tau0 + band;
+    if (lo < 2) lo = 2;
+    if (hi > N / 2) hi = N / 2;
 
-    if (fabsf(denom) > 1e-10f) {
-        float offset = (gamma - alpha) / denom;
-        if (offset >  0.5f) offset =  0.5f;
-        if (offset < -0.5f) offset = -0.5f;
-        refined += offset;
+    float dvals[2 * (PITCH_DECIM_FACTOR + 2) + 1];
+    int   count = hi - lo + 1;
+    int   bestIdx = 0;
+    for (int t = lo; t <= hi; t++) {
+        float sum = 0.0f;
+        const float* x = d->window;
+        const int limit = N - t;
+        for (int i = 0; i < limit; i++) {
+            float delta = x[i] - x[i + t];
+            sum += delta * delta;
+        }
+        dvals[t - lo] = sum;
+        if (sum < dvals[bestIdx]) bestIdx = t - lo;
     }
 
-    if (refined < 1.0f) refined = (float)period;
-    return refined;
+    int best = lo + bestIdx;
+    float refined = (float)best;
+    if (bestIdx > 0 && bestIdx < count - 1) {
+        float alpha = dvals[bestIdx - 1], beta = dvals[bestIdx], gamma = dvals[bestIdx + 1];
+        float denom = 2.0f * (2.0f * beta - alpha - gamma);
+        if (fabsf(denom) > 1e-12f) {
+            float offset = (gamma - alpha) / denom;
+            if (offset >  0.5f) offset =  0.5f;
+            if (offset < -0.5f) offset = -0.5f;
+            refined += offset;
+        }
+    }
+    return d->sampleRate / refined;
 }
 
 // ==========================================================================
@@ -449,65 +486,50 @@ static float refine_period_parabolic(const float* cmndf, int period, int maxTauP
 // ==========================================================================
 
 static void run_analysis(PitchDetector* d) {
-    const int N  = d->windowSize;
-    const int H  = d->halfWindow;
-    const int mt = d->minTau;   // search floor = sampleRate / maxHz
-    const int MT = d->maxTau;   // search ceiling = sampleRate / minHz
+    const int N   = d->windowSize;
+    const int ND  = d->decWindowSize;
+    const int MT  = d->maxTauD;
+    const int mnT = d->minTauD;
 
-    // Step 1 — DC removal
-    remove_dc(d->window, N);
-
-    // Step 2 — RMS + peak gate
+    // Step 1 — gates measured on the full-rate window (input-level semantics)
     float rms, peak;
     measure_signal(d->window, N, &rms, &peak);
-
     if (rms < d->config.powerThreshold || peak < d->config.peakThreshold) {
         invalidate_result(d);
         return;
     }
 
-    // Step 3 — Direct YIN difference function + CMNDF (always compute full H
-    // so parabolic interpolation at the boundary has valid neighbours)
-    compute_yin_difference(d);
-    compute_cmndf(d);
+    // Step 2 — DC removal on the decimated window (YIN input)
+    remove_dc(d->decWindow, ND);
 
-    // Step 4 — Threshold search: first pit below yinThreshold, walk to bottom.
-    // Search is bounded by mt (minTau, floor) and MT (maxTau, ceiling) to avoid
-    // spurious detections outside [minHz, maxHz].
-    int period = find_yin_period(d->cmndf, mt, MT, d->config.yinThreshold);
+    // Step 3 — coarse YIN on the decimated window
+    compute_yin_difference(d);   // operates on decWindow/ND, tau <= maxTauPlusD
+    compute_cmndf(d);            // tau <= maxTauPlusD
+
+    int period = find_yin_period(d->cmndf, mnT, MT, d->config.yinThreshold);
     int usedFallback = 0;
-
-    // Fallback: global minimum within mt..MT if within fallbackThreshold
     if (period < 0) {
-        period = find_best_period_fallback(d->cmndf, mt, MT, d->config.fallbackThreshold);
+        period = find_best_period_fallback(d->cmndf, mnT, MT, d->config.fallbackThreshold);
         usedFallback = (period >= 0);
     }
-
     if (period < 0) {
         invalidate_result(d);
 #if DEBUG_PITCH
         {
             int   gt = -1; float gv = 1.0f;
-            for (int t = mt; t <= MT; t++) {
+            for (int t = mnT; t <= MT; t++) {
                 if (d->cmndf[t] < gv) { gv = d->cmndf[t]; gt = t; }
             }
             printf("[DSP] rms=%.5f peak=%.5f | INVALID globalMin tau=%d cmndf=%.4f hz=%.1f\n",
-                   rms, peak, gt, gv, gt > 0 ? d->sampleRate / (float)gt : -1.0f);
+                   rms, peak, gt, gv, gt > 0 ? d->decRate / (float)gt : -1.0f);
         }
 #endif
         return;
     }
 
-    // Step 5 — Harmonic correction: prefer shorter period (higher frequency,
-    // truer fundamental) if its CMNDF is within octaveTolerance of the detected
-    // period. Guard prevents correction for notes already in the upper range.
+    // Step 4 — harmonic corrections (decimated domain, unchanged logic)
     int rawPeriod = period;
-    period = correct_harmonic_period(d->cmndf, period, mt, MT, d->config.octaveTolerance);
-
-    // Step 5b — Sub-fundamental correction: if the octave-up correction did not
-    // fire, check whether period*2 is a deeper pit (wound-string over-harmonic lock).
-    // The two corrections are mutually exclusive: a period cannot be both too long
-    // and too short simultaneously.
+    period = correct_harmonic_period(d->cmndf, period, mnT, MT, d->config.octaveTolerance);
     if (period == rawPeriod) {
         period = correct_sub_harmonic_period(d->cmndf, period, MT, d->config.yinThreshold);
     }
@@ -515,16 +537,15 @@ static void run_analysis(PitchDetector* d) {
 #if DEBUG_PITCH
     if (period != rawPeriod) {
         printf("[DSP] harmonic-correct: %d(%.1fHz)→%d(%.1fHz) cmndf %.3f→%.3f\n",
-               rawPeriod, d->sampleRate / (float)rawPeriod,
-               period,    d->sampleRate / (float)period,
+               rawPeriod, d->decRate / (float)rawPeriod,
+               period,    d->decRate / (float)period,
                d->cmndf[rawPeriod], d->cmndf[period]);
     }
 #endif
 
-    // Step 6 — Confidence gate: depth + local contrast
-    float contrast   = local_contrast(d->cmndf, period, H);
+    // Step 5 — confidence gate from the coarse CMNDF
+    float contrast   = local_contrast(d->cmndf, period, MT);
     float confidence = compute_confidence(d->cmndf[period], contrast);
-
     if (confidence < d->config.minConfidence) {
         invalidate_result(d);
 #if DEBUG_PITCH
@@ -534,10 +555,9 @@ static void run_analysis(PitchDetector* d) {
         return;
     }
 
-    // Step 7 — Parabolic interpolation on the corrected period
-    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
-    float tau_refined = refine_period_parabolic(d->cmndf, period, maxTauPlus);
-    float hz          = d->sampleRate / tau_refined;
+    // Step 6 — full-rate refine: raw difference function in a narrow band
+    // around 4×period, local minimum + parabolic interpolation.
+    float hz = refine_full_rate(d, period);
 
     push_result(d, hz, confidence);
 
@@ -581,9 +601,11 @@ void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
 
             // Copy most recent N samples from ring buffer (chronological order)
             int start = d->writePos;
-            for (int j = 0; j < N; j++) {
+            for (int j = 0; j < N; j++)
                 d->window[j] = d->ringBuffer[(start + j) % N];
-            }
+            int dstart = d->decWritePos;
+            for (int j = 0; j < d->decWindowSize; j++)
+                d->decWindow[j] = d->decRing[(dstart + j) % d->decWindowSize];
 
             run_analysis(d);
         }

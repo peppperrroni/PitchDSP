@@ -18,7 +18,7 @@
 // fundamental.
 //
 // Set DEBUG_PITCH 1 to enable per-analysis console logging.
-#define DEBUG_PITCH 0
+#define DEBUG_PITCH 1
 
 #include "PitchDSP.h"
 #include <stdlib.h>
@@ -287,12 +287,31 @@ static void run_analysis(PitchDetector* d) {
 
     // Step 6 — Threshold search: first pit below yinThreshold, walk to bottom
     int period = find_yin_period(d->cmndf, H, d->config.yinThreshold);
+    int usedFallback = 0;
 
     // Fallback: global minimum if within fallbackThreshold
     // (helps strings whose CMNDF minimum sits just above yinThreshold)
     if (period < 0) {
         period = find_best_period_fallback(d->cmndf, H, d->config.fallbackThreshold);
+        usedFallback = (period >= 0);
     }
+
+#if DEBUG_PITCH
+    // Always log global CMNDF minimum so we can see what YIN found even on failure
+    {
+        int   globalBestTau = -1;
+        float globalBestVal = 1.0f;
+        for (int t = 2; t <= H; t++) {
+            if (d->cmndf[t] < globalBestVal) {
+                globalBestVal = d->cmndf[t];
+                globalBestTau = t;
+            }
+        }
+        float globalHz = (globalBestTau > 0) ? d->sampleRate / (float)globalBestTau : -1.0f;
+        printf("[DSP] rms=%.5f peak=%.5f | globalMin tau=%d cmndf=%.4f hz=%.1f | period=%d fallback=%d\n",
+               rms, peak, globalBestTau, globalBestVal, globalHz, period, usedFallback);
+    }
+#endif
 
     if (period < 0) {
         invalidate_result(d);

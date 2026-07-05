@@ -444,6 +444,27 @@ static void test_drain_overwrites_oldest(void) {
     pitchDetectorDestroy(det);
 }
 
+static void test_maxhz_floor_enforced(void) {
+    BEGIN_TEST("api/maxHz_floor");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    cfg.maxHz = 200.0f;   // force 330 Hz out of range
+    int n = 8192 * 10;
+    float* s = gen_sine(330.0f, 48000.0f, n);
+    RunResult r = run_detector(s, n, 48000.0f, cfg); free(s);
+    for (int i = 0; i < r.count; i++) {
+        if (r.frames[i].hz <= 0.0f) continue;
+        EXPECT(r.frames[i].hz <= 200.0f + 1.0f,
+               "hz=%.1f above maxHz=200", r.frames[i].hz);
+    }
+}
+
+static void test_default_config_has_maxhz(void) {
+    BEGIN_TEST("api/default_maxHz");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    EXPECT(cfg.maxHz > 900.0f && cfg.maxHz < 1100.0f,
+           "default maxHz=%.0f, want ~1000", cfg.maxHz);
+}
+
 // ==========================================================================
 //  Suite 2: Synthetic Corpus  (production config, 44100 Hz pure sines)
 // ==========================================================================
@@ -502,6 +523,8 @@ int main(int argc, char** argv) {
     test_drain_delivers_every_analysis();
     test_drain_includes_invalid_frames();
     test_drain_overwrites_oldest();
+    test_maxhz_floor_enforced();
+    test_default_config_has_maxhz();
     printf("\n");
 
     // ------------------------------------------------------------------

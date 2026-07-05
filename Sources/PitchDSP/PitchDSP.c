@@ -47,6 +47,7 @@ struct PitchDetector {
     PitchDetectorConfig config;
     int         hopSize;
     int         maxTau;   // sampleRate / minHz — upper bound for tau search
+    int         minTau;   // sampleRate / maxHz — lower bound for tau search
 
     // Ring buffer (circular audio accumulation)
     float*      ringBuffer;
@@ -83,6 +84,7 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
         .minConfidence     = 0.72f,   // gate: reject if depth+contrast confidence < this
         .hopDivisor        = 8,       // analysis rate = sampleRate / (windowSize/8)
         .minHz             = 25.0f,   // lower frequency limit → maxTau = sampleRate/minHz
+        .maxHz             = 1000.0f, // upper frequency limit → minTau = sampleRate/maxHz
     };
 }
 
@@ -98,6 +100,13 @@ static int compute_max_tau(float sampleRate, float minHz, int halfWindow) {
     return (mt < halfWindow) ? mt : halfWindow;
 }
 
+// Compute the tau search floor from maxHz, clamped to >= 2.
+static int compute_min_tau(float sampleRate, float maxHz) {
+    float hz = (maxHz > 0.0f) ? maxHz : 1000.0f;
+    int   mt = (int)(sampleRate / hz);
+    return (mt < 2) ? 2 : mt;
+}
+
 PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetectorConfig config) {
     PitchDetector* d = (PitchDetector*)calloc(1, sizeof(PitchDetector));
     if (!d) return NULL;
@@ -110,6 +119,7 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
     d->config     = config;
     d->hopSize    = windowSize / divisor;
     d->maxTau     = compute_max_tau(sampleRate, config.minHz, d->halfWindow);
+    d->minTau     = compute_min_tau(sampleRate, config.maxHz);
 
     d->ringBuffer = (float*)calloc((size_t)windowSize, sizeof(float));
     d->window     = (float*)calloc((size_t)windowSize, sizeof(float));
@@ -143,6 +153,7 @@ void pitchDetectorConfigure(PitchDetector* d, PitchDetectorConfig config) {
     d->config  = config;
     d->hopSize = d->windowSize / divisor;
     d->maxTau  = compute_max_tau(d->sampleRate, config.minHz, d->halfWindow);
+    d->minTau  = compute_min_tau(d->sampleRate, config.maxHz);
 }
 
 // ==========================================================================
@@ -193,13 +204,15 @@ static void measure_signal(const float* window, int n, float* rms_out, float* pe
 // Direct YIN squared difference function.
 // d(0) = 0; d(τ) = Σ_{i=0}^{N-τ-1} (x[i] − x[i+τ])²
 // Direct (non-FFT) computation: linear autocorrelation, no circular artifacts.
+// Computed only up to maxTau + 1 (parabolic neighbour for refinement).
 static void compute_yin_difference(PitchDetector* d) {
     const int N = d->windowSize;
     const int H = d->halfWindow;
+    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
 
     d->diff[0] = 0.0f;
 
-    for (int tau = 1; tau <= H; tau++) {
+    for (int tau = 1; tau <= maxTauPlus; tau++) {
         float sum = 0.0f;
         const int limit = N - tau;
         for (int i = 0; i < limit; i++) {
@@ -212,13 +225,15 @@ static void compute_yin_difference(PitchDetector* d) {
 
 // CMNDF from diff[].
 // d'(0) = 1; d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
+// Computed only up to maxTau + 1 (parabolic neighbour for refinement).
 static void compute_cmndf(PitchDetector* d) {
     const int H = d->halfWindow;
+    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
 
     float cumSum  = 0.0f;
     d->cmndf[0] = 1.0f;
 
-    for (int tau = 1; tau <= H; tau++) {
+    for (int tau = 1; tau <= maxTauPlus; tau++) {
         cumSum += d->diff[tau];
         d->cmndf[tau] = (cumSum > 0.0f)
             ? d->diff[tau] * (float)tau / cumSum
@@ -227,11 +242,11 @@ static void compute_cmndf(PitchDetector* d) {
 }
 
 // Find the first CMNDF pit whose minimum is below threshold.
-// Searches only up to maxTau (= sampleRate/minHz) to avoid the systematic
+// Searches only from minTau to maxTau to avoid the systematic
 // downward CMNDF bias that appears near halfWindow in the direct YIN method.
 // Returns -1 if no qualifying pit found.
-static int find_yin_period(const float* cmndf, int maxTau, float threshold) {
-    for (int tau = 2; tau <= maxTau; tau++) {
+static int find_yin_period(const float* cmndf, int minTau, int maxTau, float threshold) {
+    for (int tau = minTau; tau <= maxTau; tau++) {
         if (cmndf[tau] < threshold) {
             while (tau + 1 <= maxTau && cmndf[tau + 1] < cmndf[tau]) tau++;
             return tau;
@@ -240,16 +255,16 @@ static int find_yin_period(const float* cmndf, int maxTau, float threshold) {
     return -1;
 }
 
-// Fallback: return the tau of the global CMNDF minimum within 2..maxTau if
+// Fallback: return the tau of the global CMNDF minimum within minTau..maxTau if
 // it is below fallbackThreshold. Used when no pit satisfies yinThreshold.
 // Capping at maxTau prevents spurious sub-bass detections caused by the
 // direct-YIN CMNDF bias: at large τ (near halfWindow=N/2) the expected
 // CMNDF for noise is (N-τ)/(N-τ/2) ≈ 0.67 rather than 1.0, so the region
 // near halfWindow always looks like a broad, low-valued "dip".
-static int find_best_period_fallback(const float* cmndf, int maxTau, float fallbackThreshold) {
+static int find_best_period_fallback(const float* cmndf, int minTau, int maxTau, float fallbackThreshold) {
     int   bestTau = -1;
     float bestVal = 1.0f;
-    for (int tau = 2; tau <= maxTau; tau++) {
+    for (int tau = minTau; tau <= maxTau; tau++) {
         if (cmndf[tau] < bestVal) {
             bestVal = cmndf[tau];
             bestTau = tau;
@@ -275,14 +290,14 @@ static int find_best_period_fallback(const float* cmndf, int maxTau, float fallb
 // For a clean A1 signal: CMNDF(875)=0.08, CMNDF(437)=0.16,
 // threshold=0.08+0.06=0.14 < 0.16 → no correction. ✓
 // For G3 (tau=225) with maxTau=1633: 225 ≤ 1633/3=544 → guard skips. ✓
-static int correct_harmonic_period(const float* cmndf, int period, int maxTau, float tolerance) {
+static int correct_harmonic_period(const float* cmndf, int period, int minTau, int maxTau, float tolerance) {
     if (tolerance <= 0.0f) return period;
     // Only correct when the note is in the lower third of the valid range.
     if (period <= maxTau / 3) return period;
     float threshold = cmndf[period] + tolerance;
     for (int N = 2; N <= 5; N++) {
         int sub = period / N;
-        if (sub < 2) break;
+        if (sub < minTau) break;
         if (sub <= maxTau && cmndf[sub] < threshold) {
             return sub;
         }
@@ -363,10 +378,11 @@ static float compute_confidence(float cmndfValue, float contrast) {
 }
 
 // Parabolic interpolation around the CMNDF minimum for sub-sample precision.
-static float refine_period_parabolic(const float* cmndf, int period, int H) {
+// maxTauPlus bounds the neighbour lookup (== maxTau + 1 for valid parabolic access).
+static float refine_period_parabolic(const float* cmndf, int period, int maxTauPlus) {
     float alpha = (period > 1) ? cmndf[period - 1] : cmndf[period];
     float beta  = cmndf[period];
-    float gamma = (period < H) ? cmndf[period + 1] : cmndf[period];
+    float gamma = (period < maxTauPlus) ? cmndf[period + 1] : cmndf[period];
 
     float denom   = 2.0f * (2.0f * beta - alpha - gamma);
     float refined = (float)period;
@@ -389,6 +405,7 @@ static float refine_period_parabolic(const float* cmndf, int period, int H) {
 static void run_analysis(PitchDetector* d) {
     const int N  = d->windowSize;
     const int H  = d->halfWindow;
+    const int mt = d->minTau;   // search floor = sampleRate / maxHz
     const int MT = d->maxTau;   // search ceiling = sampleRate / minHz
 
     // Step 1 — DC removal
@@ -409,13 +426,14 @@ static void run_analysis(PitchDetector* d) {
     compute_cmndf(d);
 
     // Step 4 — Threshold search: first pit below yinThreshold, walk to bottom.
-    // Search is capped at MT to avoid the downward CMNDF bias near halfWindow.
-    int period = find_yin_period(d->cmndf, MT, d->config.yinThreshold);
+    // Search is bounded by mt (minTau, floor) and MT (maxTau, ceiling) to avoid
+    // spurious detections outside [minHz, maxHz].
+    int period = find_yin_period(d->cmndf, mt, MT, d->config.yinThreshold);
     int usedFallback = 0;
 
-    // Fallback: global minimum within 2..MT if within fallbackThreshold
+    // Fallback: global minimum within mt..MT if within fallbackThreshold
     if (period < 0) {
-        period = find_best_period_fallback(d->cmndf, MT, d->config.fallbackThreshold);
+        period = find_best_period_fallback(d->cmndf, mt, MT, d->config.fallbackThreshold);
         usedFallback = (period >= 0);
     }
 
@@ -424,7 +442,7 @@ static void run_analysis(PitchDetector* d) {
 #if DEBUG_PITCH
         {
             int   gt = -1; float gv = 1.0f;
-            for (int t = 2; t <= MT; t++) {
+            for (int t = mt; t <= MT; t++) {
                 if (d->cmndf[t] < gv) { gv = d->cmndf[t]; gt = t; }
             }
             printf("[DSP] rms=%.5f peak=%.5f | INVALID globalMin tau=%d cmndf=%.4f hz=%.1f\n",
@@ -438,7 +456,7 @@ static void run_analysis(PitchDetector* d) {
     // truer fundamental) if its CMNDF is within octaveTolerance of the detected
     // period. Guard prevents correction for notes already in the upper range.
     int rawPeriod = period;
-    period = correct_harmonic_period(d->cmndf, period, MT, d->config.octaveTolerance);
+    period = correct_harmonic_period(d->cmndf, period, mt, MT, d->config.octaveTolerance);
 
     // Step 5b — Sub-fundamental correction: if the octave-up correction did not
     // fire, check whether period*2 is a deeper pit (wound-string over-harmonic lock).
@@ -471,7 +489,8 @@ static void run_analysis(PitchDetector* d) {
     }
 
     // Step 7 — Parabolic interpolation on the corrected period
-    float tau_refined = refine_period_parabolic(d->cmndf, period, H);
+    const int maxTauPlus = (d->maxTau + 1 < H) ? d->maxTau + 1 : H;
+    float tau_refined = refine_period_parabolic(d->cmndf, period, maxTauPlus);
     float hz          = d->sampleRate / tau_refined;
 
     push_result(d, hz, confidence);

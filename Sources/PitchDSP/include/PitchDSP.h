@@ -78,6 +78,14 @@ typedef struct {
     /// cap, sub-bass artifacts at τ≈3000-4096 (11-17 Hz) can pass the fallbackThreshold
     /// gate. Raise to 60-70 Hz for guitar-only applications to tighten the search range.
     float minHz;
+
+    /// Upper frequency bound in Hz. Default: 1000.0.
+    /// Sets the tau search floor: minTau = sampleRate / maxHz. Prevents noisy
+    /// frames from locking onto spurious tiny-tau dips (implausibly high
+    /// frequencies). Note: for a periodic signal whose fundamental is above
+    /// maxHz, the detector reports the first period multiple inside the range
+    /// (a subharmonic) — by design, reported hz is always within [minHz, maxHz].
+    float maxHz;
 } PitchDetectorConfig;
 
 // ---------------------------------------------------------------------------

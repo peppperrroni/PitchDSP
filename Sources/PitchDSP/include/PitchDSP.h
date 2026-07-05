@@ -73,6 +73,15 @@ typedef struct {
     /// Analysis rate = sampleRate / (windowSize / hopDivisor).
     /// Default: 8 → ~47fps at 48kHz with windowSize=8192.
     int   hopDivisor;
+
+    /// Lower frequency bound in Hz. Default: 25.0 (covers 5-string bass B0 = 30.87 Hz).
+    /// Sets the tau search ceiling: maxTau = sampleRate / minHz. This prevents spurious
+    /// detections in the region near halfWindow (τ > N/4) where the direct-YIN CMNDF
+    /// has a systematic downward bias: for random noise, E[CMNDF(τ)] ≈ (N-τ)/(N-τ/2),
+    /// which falls to ~0.67 at τ = halfWindow rather than the ideal 1.0. Without this
+    /// cap, sub-bass artifacts at τ≈3000-4096 (11-17 Hz) can pass the fallbackThreshold
+    /// gate. Raise to 60-70 Hz for guitar-only applications to tighten the search range.
+    float minHz;
 } PitchDetectorConfig;
 
 // ---------------------------------------------------------------------------

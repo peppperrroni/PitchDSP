@@ -59,6 +59,14 @@ typedef struct {
     /// (e.g. wound G string under a microphone).
     float fallbackThreshold;
 
+    /// Harmonic correction threshold. Default: 0.45.
+    /// After finding a period T, the detector checks if T/N (N = 2..5) has a
+    /// CMNDF value below this threshold. If so, it prefers the shorter period
+    /// (higher frequency = the true fundamental). Corrects the octave-down
+    /// error common on wound strings (e.g. G3 detected as G1).
+    /// Set to 0.0 to disable harmonic correction.
+    float harmonicCorrThreshold;
+
     /// Analysis rate = sampleRate / (windowSize / hopDivisor).
     /// Default: 8 → ~47fps at 48kHz with windowSize=8192.
     int   hopDivisor;

@@ -110,11 +110,12 @@ static void fft_inplace(float* re, float* im, int n, int sign) {
 
 PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     return (PitchDetectorConfig){
-        .powerThreshold    = 1e-5f,   // -50 dBFS RMS gate
-        .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
-        .yinThreshold      = 0.15f,   // primary CMNDF threshold
-        .fallbackThreshold = 0.25f,   // accept global min if no primary pit found
-        .hopDivisor        = 8,       // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
+        .powerThreshold       = 1e-5f,  // -50 dBFS RMS gate
+        .peakThreshold        = 0.005f, // 0.5% peak gate — stops decaying tail noise
+        .yinThreshold         = 0.15f,  // primary CMNDF threshold
+        .fallbackThreshold    = 0.25f,  // accept global min if no primary pit found
+        .harmonicCorrThreshold= 0.45f,  // correct octave-down errors (wound G string)
+        .hopDivisor           = 8,      // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
     };
 }
 
@@ -231,6 +232,31 @@ static int find_best_period_fallback(const float* cmndf, int H, float fallbackTh
     return (bestTau >= 0 && bestVal < fallbackThreshold) ? bestTau : -1;
 }
 
+// Harmonic correction: YIN can latch onto a sub-harmonic (period × N) when
+// the fundamental is weak relative to upper harmonics (common on the wound
+// G string where the 4th harmonic can dominate the autocorrelation).
+// Strategy: for each divisor N = 2..5, if cmndf[period/N] < threshold,
+// prefer the shorter period (higher pitch = true fundamental). We iterate
+// N ascending so that in case multiple sub-periods pass, we end up with the
+// shortest one (highest frequency) — period/5 is preferred over period/2.
+static int correct_harmonic_period(const float* cmndf, int period, int H, float threshold) {
+    if (threshold <= 0.0f) return period;   // correction disabled
+    int best = period;
+    for (int N = 2; N <= 5; N++) {
+        int sub = period / N;
+        if (sub < 2) break;
+        if (sub <= H && cmndf[sub] < threshold) {
+            best = sub;   // ascending N: overwrites with progressively shorter periods
+        }
+    }
+    if (best != period) {
+        // Walk to the local CMNDF minimum near the corrected period
+        while (best > 2 && cmndf[best - 1] < cmndf[best]) best--;
+        while (best < H && cmndf[best + 1] < cmndf[best]) best++;
+    }
+    return best;
+}
+
 // ==========================================================================
 //  Analysis (called internally every hopSize samples)
 // ==========================================================================
@@ -294,6 +320,23 @@ static void run_analysis(PitchDetector* d) {
     if (period < 0) {
         period = find_best_period_fallback(d->cmndf, H, d->config.fallbackThreshold);
         usedFallback = (period >= 0);
+    }
+
+    // Step 6.5 — Harmonic correction
+    // Fix octave-down errors: if period/N has a lower CMNDF below
+    // harmonicCorrThreshold, the true fundamental is N× higher.
+    if (period >= 0) {
+        int corrected = correct_harmonic_period(d->cmndf, period, H,
+                                                d->config.harmonicCorrThreshold);
+#if DEBUG_PITCH
+        if (corrected != period) {
+            printf("[DSP] harmonic-correct: %d(%.1fHz)→%d(%.1fHz) cmndf %.3f→%.3f\n",
+                   period, d->sampleRate / (float)period,
+                   corrected, d->sampleRate / (float)corrected,
+                   d->cmndf[period], d->cmndf[corrected]);
+        }
+#endif
+        period = corrected;
     }
 
 #if DEBUG_PITCH

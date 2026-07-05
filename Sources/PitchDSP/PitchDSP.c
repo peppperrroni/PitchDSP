@@ -7,18 +7,26 @@
 //   Autocorrelation is computed via FFT in O(n log n).
 //   The Cumulative Mean Normalized Difference Function (CMNDF) is:
 //     d'(0)=1,  d'(τ)= d(τ)·τ / Σ_{j=1}^{τ} d(j)
-//   The first τ with d'(τ) < threshold and d'(τ) < d'(τ-1) is the period.
-//   Parabolic interpolation refines the sub-sample estimate.
-//   confidence = 1 − d'(τ_best): 1.0 = clean, 0.0 = noise.
+//   The first pit below yinThreshold is found and its bottom is taken
+//   as the period estimate. Parabolic interpolation refines sub-sample.
 //
-// Octave safety: taking the *first* sub-threshold minimum always returns
-// the fundamental period — never a sub-multiple (which would be a shorter
-// period at a higher lag-index, never found first).
+// NOTE on octave safety: YIN tends to find the fundamental period, but
+// can detect harmonics (especially the 2nd/4th) when they are stronger
+// than the fundamental in the autocorrelation. Harmonic correction
+// (checking period × 2..5) is done in a higher layer. The raw DSP
+// result should be treated as "best YIN candidate", not a guaranteed
+// fundamental.
+//
+// Set DEBUG_PITCH 1 to enable per-analysis console logging.
+#define DEBUG_PITCH 0
 
 #include "PitchDSP.h"
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#if DEBUG_PITCH
+#include <stdio.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -102,9 +110,11 @@ static void fft_inplace(float* re, float* im, int n, int sign) {
 
 PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     return (PitchDetectorConfig){
-        .powerThreshold = 1e-5f,   // -50 dBFS
-        .yinThreshold   = 0.15f,   // industry standard starting point
-        .hopDivisor     = 8,       // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
+        .powerThreshold    = 1e-5f,   // -50 dBFS RMS gate
+        .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
+        .yinThreshold      = 0.15f,   // primary CMNDF threshold
+        .fallbackThreshold = 0.25f,   // accept global min if no primary pit found
+        .hopDivisor        = 8,       // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
     };
 }
 
@@ -160,6 +170,68 @@ void pitchDetectorConfigure(PitchDetector* d, PitchDetectorConfig config) {
 }
 
 // ==========================================================================
+//  Analysis helpers
+// ==========================================================================
+
+// Remove DC offset in-place.
+static void remove_dc(float* x, int n) {
+    float mean = 0.0f;
+    for (int i = 0; i < n; i++) mean += x[i];
+    mean /= (float)n;
+    for (int i = 0; i < n; i++) x[i] -= mean;
+}
+
+// Write invalid result and increment sequence.
+static void invalidate_result(PitchDetector* d) {
+    d->result.hz         = -1.0f;
+    d->result.confidence = 0.0f;
+    d->result.sequence++;
+}
+
+// Measure RMS and peak of window. Fills *rms_out and *peak_out.
+static void measure_signal(const float* window, int n, float* rms_out, float* peak_out) {
+    float power = 0.0f, peak = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float s = window[i];
+        power += s * s;
+        float a = fabsf(s);
+        if (a > peak) peak = a;
+    }
+    *rms_out  = sqrtf(power / (float)n);
+    *peak_out = peak;
+}
+
+// Find the first CMNDF pit whose minimum is below threshold.
+// "First pit" = enter below threshold, walk to the local minimum.
+// Returns the tau at the pit bottom, or -1 if none found.
+static int find_yin_period(const float* cmndf, int H, float threshold) {
+    for (int tau = 2; tau <= H; tau++) {
+        if (cmndf[tau] < threshold) {
+            // Walk to the bottom of this pit
+            while (tau + 1 <= H && cmndf[tau + 1] < cmndf[tau]) {
+                tau++;
+            }
+            return tau;
+        }
+    }
+    return -1;
+}
+
+// Fallback: return the tau of the global CMNDF minimum if it is below
+// fallbackThreshold. Used when no pit satisfies yinThreshold.
+static int find_best_period_fallback(const float* cmndf, int H, float fallbackThreshold) {
+    int   bestTau = -1;
+    float bestVal = 1.0f;
+    for (int tau = 2; tau <= H; tau++) {
+        if (cmndf[tau] < bestVal) {
+            bestVal = cmndf[tau];
+            bestTau = tau;
+        }
+    }
+    return (bestTau >= 0 && bestVal < fallbackThreshold) ? bestTau : -1;
+}
+
+// ==========================================================================
 //  Analysis (called internally every hopSize samples)
 // ==========================================================================
 
@@ -167,41 +239,41 @@ static void run_analysis(PitchDetector* d) {
     const int N = d->windowSize;
     const int H = d->halfWindow;
 
-    // Step 1 — Power gate: RMS of current window
-    float power = 0.0f;
-    for (int i = 0; i < N; i++) {
-        float s = d->window[i];
-        power += s * s;
-    }
-    float rms = sqrtf(power / (float)N);
+    // Step 1 — DC removal
+    // A DC offset biases the difference function; removing it first gives
+    // a cleaner CMNDF, especially important for close-mic recordings.
+    remove_dc(d->window, N);
 
-    if (rms < d->config.powerThreshold) {
-        d->result.hz         = -1.0f;
-        d->result.confidence = 0.0f;
-        d->result.sequence++;
+    // Step 2 — RMS + peak gate
+    float rms, peak;
+    measure_signal(d->window, N, &rms, &peak);
+
+    if (rms < d->config.powerThreshold || peak < d->config.peakThreshold) {
+        invalidate_result(d);
         return;
     }
 
-    // Step 2 — Forward FFT of the window
-    // Load window into FFT buffers
+    // Step 3 — Forward FFT of the window
     for (int i = 0; i < N; i++) {
         d->fftReal[i] = d->window[i];
         d->fftImag[i] = 0.0f;
     }
     fft_inplace(d->fftReal, d->fftImag, N, -1);
 
-    // Step 3 — Power spectrum: |X[k]|² (autocorrelation via IFFT of power spectrum)
+    // Step 4 — Power spectrum → autocorrelation via IFFT
+    // r(τ) = IFFT(|X[k]|²). Note: this is circular autocorrelation (no
+    // zero-padding). For large τ (low-frequency notes near B0) the circular
+    // wrap-around can introduce small errors; a future improvement would
+    // zero-pad to 2N. For guitar range (B2–E6) the effect is negligible.
     for (int i = 0; i < N; i++) {
         d->fftReal[i] = d->fftReal[i] * d->fftReal[i] + d->fftImag[i] * d->fftImag[i];
         d->fftImag[i] = 0.0f;
     }
     fft_inplace(d->fftReal, d->fftImag, N, 1);
-    // fftReal[tau] = r(tau) = autocorrelation at lag tau
 
-    // Step 4 — CMNDF
-    // d(tau) = 2*(r(0) - r(tau))
-    // d'(0) = 1
-    // d'(tau) = d(tau) * tau / sum_{j=1}^{tau} d(j)
+    // Step 5 — CMNDF
+    // d(τ) = 2·(r(0) − r(τ));  d'(0) = 1;
+    // d'(τ) = d(τ)·τ / Σ_{j=1}^{τ} d(j)
     float r0     = d->fftReal[0];
     float cumSum = 0.0f;
     d->cmndf[0]  = 1.0f;
@@ -213,46 +285,50 @@ static void run_analysis(PitchDetector* d) {
         d->cmndf[tau] = (cumSum > 0.0f) ? (diff * (float)tau / cumSum) : 1.0f;
     }
 
-    // Step 5 — Threshold search: first local minimum below yinThreshold
-    // "first tau where d'(tau) < threshold AND d'(tau) < d'(tau-1)"
-    int period = -1;
-    for (int tau = 2; tau <= H; tau++) {
-        if (d->cmndf[tau] < d->config.yinThreshold &&
-            d->cmndf[tau] < d->cmndf[tau - 1]) {
-            period = tau;
-            break;
-        }
+    // Step 6 — Threshold search: first pit below yinThreshold, walk to bottom
+    int period = find_yin_period(d->cmndf, H, d->config.yinThreshold);
+
+    // Fallback: global minimum if within fallbackThreshold
+    // (helps strings whose CMNDF minimum sits just above yinThreshold)
+    if (period < 0) {
+        period = find_best_period_fallback(d->cmndf, H, d->config.fallbackThreshold);
     }
 
     if (period < 0) {
-        d->result.hz         = -1.0f;
-        d->result.confidence = 0.0f;
-        d->result.sequence++;
+        invalidate_result(d);
         return;
     }
 
-    // Step 6 — Parabolic interpolation for sub-sample precision
-    float alpha = (period > 1) ? d->cmndf[period - 1] : d->cmndf[period];
-    float beta  = d->cmndf[period];
-    float gamma = (period < H) ? d->cmndf[period + 1] : d->cmndf[period];
+    float beta = d->cmndf[period];  // CMNDF value at found period
 
-    float denom        = 2.0f * (2.0f * beta - alpha - gamma);
-    float tau_refined  = (float)period;
+    // Step 7 — Parabolic interpolation for sub-sample precision
+    float alpha     = (period > 1) ? d->cmndf[period - 1] : beta;
+    float gamma     = (period < H) ? d->cmndf[period + 1] : beta;
+    float denom     = 2.0f * (2.0f * beta - alpha - gamma);
+    float tau_refined = (float)period;
+
     if (fabsf(denom) > 1e-10f) {
         float offset = (gamma - alpha) / denom;
-        // Clamp offset to ±0.5 to avoid extreme refinement
         if (offset >  0.5f) offset =  0.5f;
         if (offset < -0.5f) offset = -0.5f;
         tau_refined += offset;
     }
     if (tau_refined < 1.0f) tau_refined = (float)period;
 
-    // Step 7 — Output
-    d->result.hz         = d->sampleRate / tau_refined;
-    d->result.confidence = 1.0f - beta;
-    if (d->result.confidence < 0.0f) d->result.confidence = 0.0f;
-    if (d->result.confidence > 1.0f) d->result.confidence = 1.0f;
+    // Step 8 — Output
+    float hz         = d->sampleRate / tau_refined;
+    float confidence = 1.0f - beta;
+    if (confidence < 0.0f) confidence = 0.0f;
+    if (confidence > 1.0f) confidence = 1.0f;
+
+    d->result.hz         = hz;
+    d->result.confidence = confidence;
     d->result.sequence++;
+
+#if DEBUG_PITCH
+    printf("[DSP] tau=%d hz=%.2f cmndf=%.3f conf=%.3f rms=%.5f peak=%.5f\n",
+           period, hz, beta, confidence, rms, peak);
+#endif
 }
 
 // ==========================================================================
@@ -262,7 +338,7 @@ static void run_analysis(PitchDetector* d) {
 void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
     if (!d || !samples || count <= 0) return;
 
-    const int N = d->windowSize;
+    const int N  = d->windowSize;
     const int HS = d->hopSize;
 
     for (int i = 0; i < count; i++) {

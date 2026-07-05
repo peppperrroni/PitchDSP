@@ -31,7 +31,8 @@ extern "C" {
 
 typedef struct {
     float    hz;          // Fundamental frequency Hz; -1 = no pitch detected.
-    float    confidence;  // 1 − CMNDF_min: 1.0 = clean tone, 0.0 = noise.
+    float    confidence;  // Quality score 0..1. Combines CMNDF depth and local contrast.
+                          // > 0.72 clean tone, 0.50–0.72 usable, < 0.50 marginal/noise.
     uint32_t sequence;    // Increments on every fresh analysis; compare to detect stale reads.
 } PitchResult;
 
@@ -40,13 +41,23 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-    /// RMS gate before YIN. Default: 1e-5 (~-50 dBFS).
+    /// RMS gate — analysis skipped if window RMS < this. Default: 1e-5 (~-50 dBFS).
     float powerThreshold;
 
-    /// CMNDF minimum threshold. Default: 0.15 (industry standard).
-    /// Lower = stricter (fewer false positives, may miss weak signals).
-    /// Range: 0.05 (very strict) to 0.20 (permissive).
+    /// Peak amplitude gate — analysis skipped if peak < this. Default: 0.005.
+    /// Catches decaying tails where RMS still passes but the waveform is too quiet
+    /// to have a reliable period.
+    float peakThreshold;
+
+    /// Primary CMNDF threshold. Default: 0.15 (textbook YIN starting point).
+    /// Lower = stricter. Range: 0.05 (very strict) to 0.25 (permissive).
     float yinThreshold;
+
+    /// Fallback threshold — if no minimum is found below yinThreshold, accept the
+    /// global CMNDF minimum if it is below fallbackThreshold. Default: 0.25.
+    /// Helps strings whose CMNDF minimum sits between yinThreshold and 0.25
+    /// (e.g. wound G string under a microphone).
+    float fallbackThreshold;
 
     /// Analysis rate = sampleRate / (windowSize / hopDivisor).
     /// Default: 8 → ~47fps at 48kHz with windowSize=8192.

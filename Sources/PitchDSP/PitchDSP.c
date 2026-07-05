@@ -1,596 +1,296 @@
-// PitchDSP.c — Harmonic Product Spectrum pitch detector
+// PitchDSP.c — YIN pitch detector
 //
-// Based on https://github.com/not-chciken/guitar_tuner by not-chciken.
-// Reimplemented in plain C for the Nocturne iOS tuner.
+// ALGORITHM: YIN (de Cheveigné & Kawahara, 2002)
+// ================================================
+//   The squared difference function d(τ) = Σ(x[t] − x[t+τ])²
+//   expands to d(τ) = 2·(r(0) − r(τ)) where r is the autocorrelation.
+//   Autocorrelation is computed via FFT in O(n log n).
+//   The Cumulative Mean Normalized Difference Function (CMNDF) is:
+//     d'(0)=1,  d'(τ)= d(τ)·τ / Σ_{j=1}^{τ} d(j)
+//   The first τ with d'(τ) < threshold and d'(τ) < d'(τ-1) is the period.
+//   Parabolic interpolation refines the sub-sample estimate.
+//   confidence = 1 − d'(τ_best): 1.0 = clean, 0.0 = noise.
 //
-// ALGORITHM: Harmonic Product Spectrum (HPS)
-// ===========================================
-//
-//   Mic samples
-//       │
-//       ▼
-//   ┌─────────────┐
-//   │ Ring Buffer │  Sliding window, triggers every hopSize samples.
-//   └──────┬──────┘
-//          │
-//          ▼
-//   ┌─────────────┐
-//   │ Power Gate  │  Mean squared amplitude > 1e-6.
-//   └──────┬──────┘
-//          │
-//          ▼
-//   ┌─────────────┐
-//   │ Hann Window │  Reduce spectral leakage.
-//   └──────┬──────┘
-//          │
-//          ▼
-//   ┌─────────────┐
-//   │    FFT      │  Radix-2 Cooley-Tukey, magnitude spectrum.
-//   └──────┬──────┘
-//          │
-//          ▼
-//   ┌─────────────────────┐
-//   │ Mains Hum Suppressio│  Zero bins below 27 Hz.
-//   └──────┬──────────────┘
-//          │
-//          ▼
-//   ┌─────────────────────┐
-//   │ Octave-Band Noise   │  Per-band RMS gate (9 octave bands).
-//   │ Suppression         │  Threshold = 0.2 × band RMS.
-//   └──────┬──────────────┘
-//          │
-//          ▼
-//   ┌─────────────────────┐
-//   │ Interpolate (5×)    │  Linear upsample for sub-bin resolution.
-//   │ + L2 Normalize      │
-//   └──────┬──────────────┘
-//          │
-//          ▼
-//   ┌─────────────────────┐
-//   │ HPS                 │  Multiply spectrum with 2×, 3×, 4×, 5×
-//   │                     │  decimated copies. Fundamental peaks align.
-//   └──────┬──────────────┘
-//          │
-//          ▼
-//   ┌─────────────────────┐
-//   │ Peak → Note + Cents │  argmax → Hz → MIDI → cents.
-//   │ + Note Buffer       │  Runtime-configurable stability filter.
-//   └─────────────────────┘
+// Octave safety: taking the *first* sub-threshold minimum always returns
+// the fundamental period — never a sub-multiple (which would be a shorter
+// period at a higher lag-index, never found first).
 
 #include "PitchDSP.h"
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
-// ==========================================================================
-//  Configuration
-// ==========================================================================
-
-#define NUM_HPS              5       // Number of harmonic product spectrums
-#define CONCERT_PITCH        440.0f  // A4 reference
-#define HOP_DIVISOR_DEFAULT  8       // Default: analyze every window/8 samples (~47fps @ 48kHz)
-#define NOTE_BUFFER_MAX      8       // Maximum noteStability value
-
-#define NUM_OCTAVE_BANDS   12
-// Band boundaries ensure each critical note group has its own noise gate band.
-//
-// Split history:
-//   1.0.2: Split at 65 Hz → separated A1 (55 Hz) from D2 (73 Hz).
-//          Previously band 50-100 Hz caused D2 to zero A1's fundamental.
-//   1.0.4: Split at 43 Hz → separated E1 (41 Hz) from A1 (55 Hz).
-//          Band 27-65 Hz caused E1 body resonances to zero A1's fundamental;
-//          HPS found E1 because E1's 4th harmonic (164 Hz) ≈ A1's 3rd (165 Hz).
-//
-// Current bands (low range):
-//   27-43 Hz : B0, C1, C#1, D1, D#1, E1 (41.2 Hz)
-//   43-65 Hz : F1, F#1, G1, G#1, A1 (55 Hz), A#1, B1
-//   65-130 Hz: C2, C#2, D2 (73 Hz) ...
-static const float OCTAVE_BANDS[NUM_OCTAVE_BANDS] = {
-    27, 43, 65, 130, 260, 520, 1040, 2080, 4160, 8320, 16640, 25600
-};
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // ==========================================================================
-//  FFT — Radix-2 Cooley-Tukey (in-place, forward transform)
-// ==========================================================================
-
-static int next_pow2(int n) {
-    int p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
-
-static void fft_forward(float *re, float *im, int n) {
-    // Bit-reverse permutation
-    int j = 0;
-    for (int i = 0; i < n - 1; i++) {
-        if (i < j) {
-            float t;
-            t = re[j]; re[j] = re[i]; re[i] = t;
-            t = im[j]; im[j] = im[i]; im[i] = t;
-        }
-        int k = n >> 1;
-        while (k <= j) { j -= k; k >>= 1; }
-        j += k;
-    }
-
-    // Cooley-Tukey butterflies
-    for (int step = 2; step <= n; step <<= 1) {
-        float angle = -2.0f * (float)M_PI / (float)step;
-        float wR = cosf(angle), wI = sinf(angle);
-        int half = step >> 1;
-        for (int group = 0; group < n; group += step) {
-            float cR = 1.0f, cI = 0.0f;
-            for (int pair = 0; pair < half; pair++) {
-                int a = group + pair;
-                int b = a + half;
-                float tR = cR * re[b] - cI * im[b];
-                float tI = cR * im[b] + cI * re[b];
-                re[b] = re[a] - tR;
-                im[b] = im[a] - tI;
-                re[a] += tR;
-                im[a] += tI;
-                float nR = cR * wR - cI * wI;
-                cI = cR * wI + cI * wR;
-                cR = nR;
-            }
-        }
-    }
-}
-
-// ==========================================================================
-//  Helpers
-// ==========================================================================
-
-static int freq_to_midi(float hz) {
-    if (hz <= 0.0f) return -1;
-    return (int)roundf(69.0f + 12.0f * log2f(hz / CONCERT_PITCH));
-}
-
-static float midi_to_freq(int midi) {
-    return CONCERT_PITCH * powf(2.0f, (float)(midi - 69) / 12.0f);
-}
-
-static float compute_cents(float hz, int midi) {
-    float noteHz = midi_to_freq(midi);
-    if (noteHz <= 0.0f || hz <= 0.0f) return 0.0f;
-    // Raw cents — unclamped. Caller is responsible for clamping to ±50 for display.
-    return 1200.0f * log2f(hz / noteHz);
-}
-
-// ==========================================================================
-//  PitchDetector context
+//  Internal state
 // ==========================================================================
 
 struct PitchDetector {
-    float sampleRate;
-    int   fftSize;        // power of 2
-    int   halfFFT;        // fftSize / 2
-    int   hopSize;
-    float deltaFreq;      // sampleRate / fftSize
-
-    // Runtime configuration (updated atomically via pitchDetectorConfigure)
+    int         windowSize;
+    int         halfWindow;
+    float       sampleRate;
     PitchDetectorConfig config;
+    int         hopSize;
 
-    // Ring buffer
-    float *ringBuffer;
-    int    ringCapacity;
-    int    writePos;
-    int    samplesInBuffer;
-    int    samplesSinceAnalysis;
+    // Ring buffer (circular audio accumulation)
+    float*      ringBuffer;
+    int         writePos;
+    int         samplesSinceAnalysis;
 
-    // Pre-allocated buffers (all allocated in create, none in process)
-    float *hannWindow;     // [fftSize]
-    float *fftReal;        // [fftSize]
-    float *fftImag;        // [fftSize]
-    float *magnitudeSpec;  // [halfFFT]
-    float *magSpecInterp;  // [halfFFT * NUM_HPS]
-    float *hpsSpec;        // [halfFFT * NUM_HPS]
+    // Analysis workspace (pre-allocated, reused each hop)
+    float*      window;     // windowSize: current analysis frame
+    float*      fftReal;    // windowSize: FFT workspace (real)
+    float*      fftImag;    // windowSize: FFT workspace (imag)
+    float*      cmndf;      // halfWindow+1: CMNDF values for lags 0..halfWindow
 
-    // Note stability (max-size fixed array, runtime limit = config.noteStability)
-    int    noteBuffer[NOTE_BUFFER_MAX];
-
-    // Sequence counter — increments on every fresh analysis cycle
-    uint32_t analysisCount;
-
-    // Output
+    // Latest result (written by process, read by getResult)
     PitchResult result;
 };
 
 // ==========================================================================
-//  Public API
+//  Iterative Cooley-Tukey radix-2 DIT FFT (in-place)
+// ==========================================================================
+
+static void bit_reverse_swap(float* re, float* im, int n) {
+    int j = 0;
+    for (int i = 1; i < n; i++) {
+        int bit = n >> 1;
+        while (j & bit) { j ^= bit; bit >>= 1; }
+        j ^= bit;
+        if (i < j) {
+            float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+}
+
+// sign = -1 → forward FFT, sign = +1 → inverse FFT (with 1/N normalisation)
+static void fft_inplace(float* re, float* im, int n, int sign) {
+    bit_reverse_swap(re, im, n);
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = sign * 2.0f * (float)M_PI / (float)len;
+        float wr = cosf(ang), wi = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1.0f, ci = 0.0f;
+            int half = len >> 1;
+            for (int j = 0; j < half; j++) {
+                int u = i + j, v = i + j + half;
+                float tr = cr * re[v] - ci * im[v];
+                float ti = cr * im[v] + ci * re[v];
+                re[v] = re[u] - tr;
+                im[v] = im[u] - ti;
+                re[u] += tr;
+                im[u] += ti;
+                float new_cr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = new_cr;
+            }
+        }
+    }
+    if (sign == 1) {
+        float inv = 1.0f / (float)n;
+        for (int i = 0; i < n; i++) { re[i] *= inv; im[i] *= inv; }
+    }
+}
+
+// ==========================================================================
+//  Default config
 // ==========================================================================
 
 PitchDetectorConfig pitchDetectorDefaultConfig(void) {
-    PitchDetectorConfig cfg;
-    cfg.powerThreshold      = 1e-5f;  // ~-50 dBFS — cuts off body resonances during string decay
-    cfg.mainsHumFreq        = 27.0f;  // just below A0 (27.5 Hz), the lowest note we detect
-    cfg.noiseGateThreshold  = 0.2f;   // fraction of band RMS
-    cfg.noteStability       = 1;      // 1 = pass every frame; Swift owns all debounce
-    cfg.hopDivisor          = HOP_DIVISOR_DEFAULT;
-    cfg.subharmonicThreshold = 0.20f; // subharmonic magnitude must be ≥20% of HPS peak
-    return cfg;
+    return (PitchDetectorConfig){
+        .powerThreshold = 1e-5f,   // -50 dBFS
+        .yinThreshold   = 0.15f,   // industry standard starting point
+        .hopDivisor     = 8,       // 8192/8 = 1024 samples/hop ≈ 47fps @ 48kHz
+    };
 }
 
+// ==========================================================================
+//  Create / Destroy / Configure
+// ==========================================================================
+
 PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetectorConfig config) {
-    if (windowSize < 64 || sampleRate <= 0.0f) return NULL;
-
-    // Clamp to valid ranges
-    if (config.noteStability < 1) config.noteStability = 1;
-    if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
-    if (config.hopDivisor < 1) config.hopDivisor = 1;
-
-    PitchDetector *d = (PitchDetector *)calloc(1, sizeof(PitchDetector));
+    PitchDetector* d = (PitchDetector*)calloc(1, sizeof(PitchDetector));
     if (!d) return NULL;
 
+    int divisor = (config.hopDivisor > 0) ? config.hopDivisor : 8;
+
+    d->windowSize = windowSize;
+    d->halfWindow = windowSize / 2;
     d->sampleRate = sampleRate;
-    d->fftSize    = next_pow2(windowSize);
-    d->halfFFT    = d->fftSize / 2;
-    d->deltaFreq  = sampleRate / (float)d->fftSize;
-    d->hopSize    = d->fftSize / config.hopDivisor;
-    if (d->hopSize < 1) d->hopSize = 1;
     d->config     = config;
+    d->hopSize    = windowSize / divisor;
 
-    // Ring buffer (2× window for safe circular access)
-    d->ringCapacity = d->fftSize * 2;
-    d->ringBuffer   = (float *)calloc((size_t)d->ringCapacity, sizeof(float));
+    d->ringBuffer = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->window     = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->fftReal    = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->fftImag    = (float*)calloc((size_t)windowSize, sizeof(float));
+    d->cmndf      = (float*)calloc((size_t)(windowSize / 2 + 1), sizeof(float));
 
-    // Hann window: 0.5 * (1 - cos(2πi / (N-1)))
-    d->hannWindow = (float *)malloc((size_t)d->fftSize * sizeof(float));
-    if (d->hannWindow) {
-        for (int i = 0; i < d->fftSize; i++)
-            d->hannWindow[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(d->fftSize - 1)));
-    }
-
-    // FFT buffers
-    d->fftReal       = (float *)calloc((size_t)d->fftSize, sizeof(float));
-    d->fftImag       = (float *)calloc((size_t)d->fftSize, sizeof(float));
-    d->magnitudeSpec = (float *)calloc((size_t)d->halfFFT, sizeof(float));
-
-    // HPS buffers (interpolated size = halfFFT × NUM_HPS)
-    int interpSize    = d->halfFFT * NUM_HPS;
-    d->magSpecInterp = (float *)calloc((size_t)interpSize, sizeof(float));
-    d->hpsSpec       = (float *)calloc((size_t)interpSize, sizeof(float));
-
-    // Verify all allocations
-    if (!d->ringBuffer || !d->hannWindow || !d->fftReal || !d->fftImag ||
-        !d->magnitudeSpec || !d->magSpecInterp || !d->hpsSpec) {
+    if (!d->ringBuffer || !d->window || !d->fftReal || !d->fftImag || !d->cmndf) {
         pitchDetectorDestroy(d);
         return NULL;
     }
 
-    // Initialize note buffer to invalid
-    for (int i = 0; i < NOTE_BUFFER_MAX; i++)
-        d->noteBuffer[i] = -1;
-
-    d->result.hz   = -1.0f;
-    d->result.midi = -1;
+    d->result.hz         = -1.0f;
+    d->result.confidence = 0.0f;
+    d->result.sequence   = 0;
 
     return d;
 }
 
-void pitchDetectorConfigure(PitchDetector *d, PitchDetectorConfig config) {
-    if (!d) return;
-    if (config.noteStability < 1) config.noteStability = 1;
-    if (config.noteStability > NOTE_BUFFER_MAX) config.noteStability = NOTE_BUFFER_MAX;
-    if (config.hopDivisor < 1) config.hopDivisor = 1;
-    d->config   = config;
-    d->hopSize  = d->fftSize / config.hopDivisor;
-    if (d->hopSize < 1) d->hopSize = 1;
-}
-
-void pitchDetectorDestroy(PitchDetector *d) {
+void pitchDetectorDestroy(PitchDetector* d) {
     if (!d) return;
     free(d->ringBuffer);
-    free(d->hannWindow);
+    free(d->window);
     free(d->fftReal);
     free(d->fftImag);
-    free(d->magnitudeSpec);
-    free(d->magSpecInterp);
-    free(d->hpsSpec);
+    free(d->cmndf);
     free(d);
 }
 
-void pitchDetectorProcess(PitchDetector *d, const float *samples, int count) {
-    if (!d || !samples || count <= 0) return;
+void pitchDetectorConfigure(PitchDetector* d, PitchDetectorConfig config) {
+    if (!d) return;
+    int divisor = (config.hopDivisor > 0) ? config.hopDivisor : 8;
+    d->config  = config;
+    d->hopSize = d->windowSize / divisor;
+}
 
-    // =================================================================
-    //  1. Ring buffer accumulation
-    // =================================================================
+// ==========================================================================
+//  Analysis (called internally every hopSize samples)
+// ==========================================================================
 
-    const float *src = samples;
-    int toWrite = count;
-    if (toWrite > d->ringCapacity) {
-        src += (toWrite - d->ringCapacity);
-        toWrite = d->ringCapacity;
-    }
+static void run_analysis(PitchDetector* d) {
+    const int N = d->windowSize;
+    const int H = d->halfWindow;
 
-    for (int i = 0; i < toWrite; i++) {
-        d->ringBuffer[d->writePos] = src[i];
-        d->writePos = (d->writePos + 1) % d->ringCapacity;
-    }
-
-    d->samplesInBuffer += toWrite;
-    if (d->samplesInBuffer > d->ringCapacity)
-        d->samplesInBuffer = d->ringCapacity;
-    d->samplesSinceAnalysis += count;
-
-    if (d->samplesInBuffer < d->fftSize) return;
-    if (d->samplesSinceAnalysis < d->hopSize) return;
-    d->samplesSinceAnalysis = 0;
-    d->analysisCount++;
-
-    // =================================================================
-    //  2. Extract window start position
-    // =================================================================
-
-    int start = d->writePos - d->fftSize;
-    if (start < 0) start += d->ringCapacity;
-
-    // =================================================================
-    //  3. Power check (on raw samples, before windowing)
-    // =================================================================
-
+    // Step 1 — Power gate: RMS of current window
     float power = 0.0f;
-    for (int i = 0; i < d->fftSize; i++) {
-        int idx = (start + i) % d->ringCapacity;
-        float s = d->ringBuffer[idx];
+    for (int i = 0; i < N; i++) {
+        float s = d->window[i];
         power += s * s;
     }
-    power /= (float)d->fftSize;
+    float rms = sqrtf(power / (float)N);
 
-    if (power < d->config.powerThreshold) {
+    if (rms < d->config.powerThreshold) {
         d->result.hz         = -1.0f;
-        d->result.cents      =  0.0f;
-        d->result.midi       = -1;
-        d->result.confidence =  0.0f;
-        d->result.stability  =  0.0f;
-        d->result.sequence   =  d->analysisCount;
-        for (int i = 0; i < NOTE_BUFFER_MAX; i++)
-            d->noteBuffer[i] = -1;
+        d->result.confidence = 0.0f;
+        d->result.sequence++;
         return;
     }
 
-    // =================================================================
-    //  4. Hann window → FFT input
-    // =================================================================
-
-    for (int i = 0; i < d->fftSize; i++) {
-        int idx = (start + i) % d->ringCapacity;
-        d->fftReal[i] = d->ringBuffer[idx] * d->hannWindow[i];
+    // Step 2 — Forward FFT of the window
+    // Load window into FFT buffers
+    for (int i = 0; i < N; i++) {
+        d->fftReal[i] = d->window[i];
         d->fftImag[i] = 0.0f;
     }
+    fft_inplace(d->fftReal, d->fftImag, N, -1);
 
-    // =================================================================
-    //  5. FFT (radix-2 Cooley-Tukey)
-    // =================================================================
+    // Step 3 — Power spectrum: |X[k]|² (autocorrelation via IFFT of power spectrum)
+    for (int i = 0; i < N; i++) {
+        d->fftReal[i] = d->fftReal[i] * d->fftReal[i] + d->fftImag[i] * d->fftImag[i];
+        d->fftImag[i] = 0.0f;
+    }
+    fft_inplace(d->fftReal, d->fftImag, N, 1);
+    // fftReal[tau] = r(tau) = autocorrelation at lag tau
 
-    fft_forward(d->fftReal, d->fftImag, d->fftSize);
+    // Step 4 — CMNDF
+    // d(tau) = 2*(r(0) - r(tau))
+    // d'(0) = 1
+    // d'(tau) = d(tau) * tau / sum_{j=1}^{tau} d(j)
+    float r0     = d->fftReal[0];
+    float cumSum = 0.0f;
+    d->cmndf[0]  = 1.0f;
 
-    // =================================================================
-    //  6. Magnitude spectrum (positive frequencies only)
-    // =================================================================
-
-    for (int i = 0; i < d->halfFFT; i++) {
-        float re = d->fftReal[i];
-        float im = d->fftImag[i];
-        d->magnitudeSpec[i] = sqrtf(re * re + im * im);
+    for (int tau = 1; tau <= H; tau++) {
+        float diff = 2.0f * (r0 - d->fftReal[tau]);
+        if (diff < 0.0f) diff = 0.0f;   // numerical floor
+        cumSum += diff;
+        d->cmndf[tau] = (cumSum > 0.0f) ? (diff * (float)tau / cumSum) : 1.0f;
     }
 
-    // =================================================================
-    //  7. Mains hum suppression — zero bins below config.mainsHumFreq
-    // =================================================================
-
-    int humBins = (int)(d->config.mainsHumFreq / d->deltaFreq);
-    if (humBins > d->halfFFT) humBins = d->halfFFT;
-    for (int i = 0; i < humBins; i++)
-        d->magnitudeSpec[i] = 0.0f;
-
-    // =================================================================
-    //  8. Octave-band white noise suppression
-    //     For each band: compute RMS, zero bins < 0.2 × RMS
-    // =================================================================
-
-    for (int b = 0; b < NUM_OCTAVE_BANDS - 1; b++) {
-        int iStart = (int)(OCTAVE_BANDS[b] / d->deltaFreq);
-        int iEnd   = (int)(OCTAVE_BANDS[b + 1] / d->deltaFreq);
-        if (iEnd > d->halfFFT) iEnd = d->halfFFT;
-        if (iStart >= iEnd) continue;
-
-        // RMS magnitude in this band
-        float sumSq = 0.0f;
-        int bandSize = iEnd - iStart;
-        for (int i = iStart; i < iEnd; i++)
-            sumSq += d->magnitudeSpec[i] * d->magnitudeSpec[i];
-        float rmsEnergy = sqrtf(sumSq / (float)bandSize);
-
-        // Gate: zero bins below threshold
-        float thresh = d->config.noiseGateThreshold * rmsEnergy;
-        for (int i = iStart; i < iEnd; i++) {
-            if (d->magnitudeSpec[i] < thresh)
-                d->magnitudeSpec[i] = 0.0f;
-        }
-    }
-
-    // =================================================================
-    //  9. Interpolate (upsample ×NUM_HPS) + L2 normalize
-    // =================================================================
-
-    int interpSize = d->halfFFT * NUM_HPS;
-
-    for (int i = 0; i < interpSize; i++) {
-        float fidx = (float)i / (float)NUM_HPS;
-        int lo = (int)fidx;
-        if (lo >= d->halfFFT - 1) {
-            d->magSpecInterp[i] = d->magnitudeSpec[d->halfFFT - 1];
-        } else {
-            float frac = fidx - (float)lo;
-            d->magSpecInterp[i] = d->magnitudeSpec[lo] * (1.0f - frac)
-                                + d->magnitudeSpec[lo + 1] * frac;
-        }
-    }
-
-    // L2 normalize
-    float norm = 0.0f;
-    for (int i = 0; i < interpSize; i++)
-        norm += d->magSpecInterp[i] * d->magSpecInterp[i];
-    norm = sqrtf(norm);
-
-    if (norm < 1e-10f) return;  // all zeros — nothing to detect
-
-    float invNorm = 1.0f / norm;
-    for (int i = 0; i < interpSize; i++)
-        d->magSpecInterp[i] *= invNorm;
-
-    // =================================================================
-    //  10. Harmonic Product Spectrum
-    //      hpsSpec = mag × mag[2i] × mag[3i] × mag[4i] × mag[5i]
-    //
-    //      Loop starts at factor=2 (h=1). Factor=1 is already in hpsSpec via
-    //      the memcpy — multiplying again would square the spectrum and
-    //      over-amplify any harmonic that's louder than the fundamental.
-    // =================================================================
-
-    memcpy(d->hpsSpec, d->magSpecInterp, (size_t)interpSize * sizeof(float));
-    int hpsLen = interpSize;
-
-    for (int h = 1; h < NUM_HPS; h++) {      // start at h=1 → factor=2
-        int factor = h + 1;
-        int newLen = (interpSize + factor - 1) / factor;  // ceil division
-        if (newLen > hpsLen) newLen = hpsLen;
-
-        int allZero = 1;
-        for (int i = 0; i < newLen; i++) {
-            int srcIdx = i * factor;
-            if (srcIdx < interpSize)
-                d->hpsSpec[i] *= d->magSpecInterp[srcIdx];
-            if (d->hpsSpec[i] > 0.0f) allZero = 0;
-        }
-        hpsLen = newLen;
-        if (allZero) break;
-    }
-
-    // =================================================================
-    //  11. Find peak → frequency
-    // =================================================================
-
-    int maxIdx = 0;
-    float maxVal = 0.0f;
-    for (int i = 0; i < hpsLen; i++) {
-        if (d->hpsSpec[i] > maxVal) {
-            maxVal = d->hpsSpec[i];
-            maxIdx = i;
-        }
-    }
-
-    if (maxVal <= 0.0f) return;
-
-    // Convert interpolated index back to Hz
-    float maxFreq = (float)maxIdx * d->deltaFreq / (float)NUM_HPS;
-
-    // Frequency range guard
-    if (maxFreq < 27.0f || maxFreq > 4200.0f) return;
-
-    // =================================================================
-    //  11b. Confidence — HPS peak-to-average ratio
-    //       Clean fundamentals produce a sharp, isolated HPS peak.
-    //       Noise or body resonances produce a flatter spectrum.
-    //       Normalized so peak/avg ≥ 10 → confidence = 1.0.
-    // =================================================================
-
-    float hpsSum = 0.0f;
-    for (int i = 0; i < hpsLen; i++)
-        hpsSum += d->hpsSpec[i];
-    float hpsAvg = (hpsLen > 0) ? (hpsSum / (float)hpsLen) : 1e-20f;
-    if (hpsAvg < 1e-20f) hpsAvg = 1e-20f;
-    float confidence = maxVal / (hpsAvg * 10.0f);
-    if (confidence > 1.0f) confidence = 1.0f;
-
-    // =================================================================
-    //  11c. Subharmonic correction
-    //       If the HPS peak is at F, search a ±3-bin neighborhood around
-    //       F/2 and F/3 in the interpolated spectrum. If the local maximum
-    //       there exceeds `subharmonicThreshold` × the HPS peak magnitude,
-    //       the lower frequency is the true fundamental.
-    //
-    //       Example: E4 = 330 Hz, 3rd harmonic = 990 Hz ≈ B5.
-    //       If HPS peaks at 990 Hz but the neighborhood of 330 Hz has
-    //       significant energy (≥20% of HPS peak), output 330 Hz (E4).
-    // =================================================================
-
-    float peakMag = d->magSpecInterp[maxIdx];
-    for (int div = 2; div <= 3; div++) {
-        float subFreq = maxFreq / (float)div;
-        if (subFreq < 27.0f) break;
-
-        // Center bin for the subharmonic candidate
-        int subBinCenter = (int)(subFreq * (float)NUM_HPS / d->deltaFreq);
-
-        // Search ±3 bins for local maximum
-        int searchStart = subBinCenter - 3;
-        int searchEnd   = subBinCenter + 3;
-        if (searchStart < 0)          searchStart = 0;
-        if (searchEnd >= interpSize)  searchEnd   = interpSize - 1;
-
-        float localMax    = 0.0f;
-        int   localMaxBin = subBinCenter;
-        for (int j = searchStart; j <= searchEnd; j++) {
-            if (d->magSpecInterp[j] > localMax) {
-                localMax    = d->magSpecInterp[j];
-                localMaxBin = j;
-            }
-        }
-
-        if (peakMag > 0.0f && localMax > d->config.subharmonicThreshold * peakMag) {
-            maxFreq = (float)localMaxBin * d->deltaFreq / (float)NUM_HPS;
-            maxIdx  = localMaxBin;
+    // Step 5 — Threshold search: first local minimum below yinThreshold
+    // "first tau where d'(tau) < threshold AND d'(tau) < d'(tau-1)"
+    int period = -1;
+    for (int tau = 2; tau <= H; tau++) {
+        if (d->cmndf[tau] < d->config.yinThreshold &&
+            d->cmndf[tau] < d->cmndf[tau - 1]) {
+            period = tau;
             break;
         }
     }
 
-    // =================================================================
-    //  12. MIDI note + cents
-    // =================================================================
-
-    int midi = freq_to_midi(maxFreq);
-    if (midi < 0 || midi > 127) return;
-    float cents = compute_cents(maxFreq, midi);
-
-    // =================================================================
-    //  13. Note stability — runtime-configurable buffer
-    //      Same note must appear in config.noteStability consecutive
-    //      analyses before the result is updated.
-    // =================================================================
-
-    // Shift buffer (only use the first noteStability slots)
-    int stability = d->config.noteStability;
-    for (int i = stability - 1; i > 0; i--)
-        d->noteBuffer[i] = d->noteBuffer[i - 1];
-    d->noteBuffer[0] = midi;
-
-    // Check if all active entries match
-    int stable = 1;
-    for (int i = 1; i < stability; i++) {
-        if (d->noteBuffer[i] != d->noteBuffer[0]) {
-            stable = 0;
-            break;
-        }
+    if (period < 0) {
+        d->result.hz         = -1.0f;
+        d->result.confidence = 0.0f;
+        d->result.sequence++;
+        return;
     }
 
-    if (stable) {
-        d->result.hz         = maxFreq;
-        d->result.cents      = cents;       // raw, unclamped — Swift clamps for display
-        d->result.midi       = midi;
-        d->result.confidence = confidence;
-        d->result.stability  = 1.0f;
-        d->result.sequence   = d->analysisCount;
+    // Step 6 — Parabolic interpolation for sub-sample precision
+    float alpha = (period > 1) ? d->cmndf[period - 1] : d->cmndf[period];
+    float beta  = d->cmndf[period];
+    float gamma = (period < H) ? d->cmndf[period + 1] : d->cmndf[period];
+
+    float denom        = 2.0f * (2.0f * beta - alpha - gamma);
+    float tau_refined  = (float)period;
+    if (fabsf(denom) > 1e-10f) {
+        float offset = (gamma - alpha) / denom;
+        // Clamp offset to ±0.5 to avoid extreme refinement
+        if (offset >  0.5f) offset =  0.5f;
+        if (offset < -0.5f) offset = -0.5f;
+        tau_refined += offset;
     }
-    // If not stable, keep previous result (prevents flicker)
+    if (tau_refined < 1.0f) tau_refined = (float)period;
+
+    // Step 7 — Output
+    d->result.hz         = d->sampleRate / tau_refined;
+    d->result.confidence = 1.0f - beta;
+    if (d->result.confidence < 0.0f) d->result.confidence = 0.0f;
+    if (d->result.confidence > 1.0f) d->result.confidence = 1.0f;
+    d->result.sequence++;
 }
 
-PitchResult pitchDetectorGetResult(PitchDetector *d) {
+// ==========================================================================
+//  Process (streaming, called from audio callback)
+// ==========================================================================
+
+void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
+    if (!d || !samples || count <= 0) return;
+
+    const int N = d->windowSize;
+    const int HS = d->hopSize;
+
+    for (int i = 0; i < count; i++) {
+        d->ringBuffer[d->writePos] = samples[i];
+        d->writePos = (d->writePos + 1) % N;
+        d->samplesSinceAnalysis++;
+
+        if (d->samplesSinceAnalysis >= HS) {
+            d->samplesSinceAnalysis = 0;
+
+            // Copy most recent N samples from ring buffer (chronological order)
+            int start = d->writePos;  // oldest sample after advancing
+            for (int j = 0; j < N; j++) {
+                d->window[j] = d->ringBuffer[(start + j) % N];
+            }
+
+            run_analysis(d);
+        }
+    }
+}
+
+// ==========================================================================
+//  GetResult (safe from any thread)
+// ==========================================================================
+
+PitchResult pitchDetectorGetResult(PitchDetector* d) {
     if (!d) {
-        PitchResult empty = { -1.0f, 0.0f, -1, 0.0f, 0.0f };
-        return empty;
+        return (PitchResult){ .hz = -1.0f, .confidence = 0.0f, .sequence = 0 };
     }
     return d->result;
 }

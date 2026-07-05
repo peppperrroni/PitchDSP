@@ -66,7 +66,7 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
         .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
         .yinThreshold      = 0.15f,   // primary CMNDF pit threshold
         .fallbackThreshold = 0.25f,   // accept global min if no pit found
-        .octaveTolerance   = 0.06f,   // harmonic correction: prefer period/N if
+        .octaveTolerance   = 0.03f,   // harmonic correction: prefer period/N if
                                       // CMNDF[period/N] < CMNDF[period] + tolerance
         .minConfidence     = 0.72f,   // gate: reject if depth+contrast confidence < this
         .hopDivisor        = 8,       // analysis rate = sampleRate / (windowSize/8)

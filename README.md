@@ -1,73 +1,96 @@
 # PitchDSP
 
-A streaming pitch detection library written in C, packaged as a Swift Package for iOS.
+A streaming, monophonic pitch detector in dependency-free C11. Two-stage YIN
+(decimated coarse search + full-rate refine) with harmonic-aware corrections,
+tuned out of the box for instrument tuners spanning B0–A4. Packaged as a
+Swift Package for direct use from iOS/macOS apps.
 
-## Algorithm
-
-Uses the **YIN algorithm** (de Cheveigné & Kawahara, 2002) — direct difference method, no FFT.
-
-The **Cumulative Mean Normalized Difference Function (CMNDF)** is computed directly in the time domain. The first CMNDF minimum below the detection threshold is taken as the period, refined with parabolic interpolation for sub-sample accuracy.
-
-Two post-processing corrections handle instrument-specific edge cases:
-
-- **Harmonic correction** — when YIN locks on a sub-harmonic (detects too low), checks whether a shorter period (τ/2..τ/5) has a comparable CMNDF value and prefers the higher frequency (truer fundamental). Applied to the lower third of the valid period range.
-
-- **Sub-fundamental correction** — when a wound string's dominant second harmonic causes YIN to detect one octave too high, checks whether the doubled period has a deeper CMNDF and corrects downward. Applied to the upper third of the valid period range, with a margin requirement to prevent false corrections on well-detected signals.
-
-## API
+## Quick start
 
 ```c
-// 1. Get default config and tune it if needed
 PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
-cfg.yinThreshold    = 0.20f;   // permissive — works for guitar/bass
-cfg.minConfidence   = 0.55f;   // lower for real recordings
-cfg.minHz           = 25.0f;   // covers 5-string bass (B0 = 30.87 Hz)
-
-// 2. Create detector (windowSize 8192 recommended)
 PitchDetector* d = pitchDetectorCreate(8192, 48000.0f, cfg);
 
-// 3. Feed samples from your audio callback (any chunk size)
-pitchDetectorProcess(d, samples, sampleCount);
-
-// 4. Poll from UI thread — check sequence to detect new results
-PitchResult r = pitchDetectorGetResult(d);
-if (r.sequence != lastSequence) {
-    lastSequence = r.sequence;
-    if (r.hz > 0) {
-        // r.hz         — fundamental frequency in Hz
-        // r.confidence — quality 0..1 (depth + local contrast)
-    }
-}
+// In your audio callback (any chunk size):
+pitchDetectorProcess(d, micSamples, sampleCount);
+PitchResult results[16];
+int n = pitchDetectorDrainResults(d, results, 16);
+for (int i = 0; i < n; i++) { /* results[i].hz > 0 = pitch */ }
 
 pitchDetectorDestroy(d);
 ```
 
-### Configuration
+## Algorithm
 
-| Field | Default | Description |
+The detector runs YIN (de Cheveigné & Kawahara, 2002) in two stages rather
+than once at full rate. Incoming audio is first passed through a 47-tap
+Hamming-windowed sinc anti-alias filter and decimated 4×; the coarse search
+below runs on this quarter-rate signal, which cuts the O(N·τ) direct
+difference-function cost roughly 16× without losing low-end accuracy.
+
+Coarse YIN then computes the squared difference function and its Cumulative
+Mean Normalized Difference Function (CMNDF) directly (no FFT), searching only
+the τ range implied by `[minHz, maxHz]`. It looks for the first CMNDF dip
+below `yinThreshold`; if none qualifies, it falls back to the single deepest
+dip in range provided that dip is below `fallbackThreshold`.
+
+The coarse period candidate then passes through two corrections: a harmonic
+(sub-harmonic-lock) correction that prefers a shorter period τ/2..τ/5 when its
+CMNDF is comparably deep (fixes wound strings that make YIN settle an octave
+low), and a sub-fundamental correction that prefers the doubled period when
+it is meaningfully deeper (fixes locking onto a dominant 2nd harmonic).
+
+Once a period survives the confidence gate, it is refined at full sample rate:
+the raw (non-normalized) difference function is recomputed in a narrow band
+around the coarse period and parabolic interpolation locates the sub-sample
+minimum. Confidence = 0.75·(CMNDF pit depth) + 0.25·(τ-proportional local
+contrast × 8), clamped to 0..1.
+
+## Configuration
+
+All fields are on `PitchDetectorConfig`; get defaults via
+`pitchDetectorDefaultConfig()`.
+
+| Field | Default | Guidance |
 |---|---|---|
-| `yinThreshold` | 0.15 | Primary CMNDF threshold. Lower = stricter. Range 0.05–0.25. |
-| `fallbackThreshold` | 0.25 | Accept global CMNDF minimum if no pit found below `yinThreshold`. |
-| `octaveTolerance` | 0.03 | Margin for harmonic correction. 0 disables. |
-| `minConfidence` | 0.72 | Frames below this are reported as no-pitch (hz = −1). |
-| `hopDivisor` | 8 | Analysis rate = sampleRate / (windowSize / hopDivisor). |
-| `minHz` | 25.0 | Lower frequency bound — caps the tau search to avoid CMNDF bias near halfWindow. |
-| `powerThreshold` | 1e-5 | RMS gate (~−50 dBFS). |
-| `peakThreshold` | 0.005 | Peak amplitude gate for decaying tails. |
+| `powerThreshold` | `1e-5` | RMS gate (~-50 dBFS) below which a window is skipped. |
+| `peakThreshold` | `0.005` | Peak-amplitude gate; catches decaying tails where RMS still passes but the waveform is too quiet for a reliable period. |
+| `yinThreshold` | `0.15` | Primary CMNDF pit threshold. Lower = stricter. Range 0.05 (strict) – 0.25 (permissive). |
+| `fallbackThreshold` | `0.30` | Accept the global CMNDF minimum if no dip beats `yinThreshold`. |
+| `octaveTolerance` | `0.03` | Harmonic-correction margin: prefer period/N (N=2..5) if its CMNDF is within this of the detected period's. `0.0` disables. Lower it if spurious octave-up jumps appear. |
+| `minConfidence` | `0.60` | Frames below this confidence are reported invalid (`hz = -1`). |
+| `hopDivisor` | `8` | Analysis rate = sampleRate / (windowSize / hopDivisor); default gives ~47 fps at 48 kHz with windowSize 8192. |
+| `minHz` | `25.0` | Lower frequency bound; sets the τ search ceiling. Covers 5-string bass B0 (30.87 Hz). Raise to 60-70 Hz for guitar-only apps to tighten the range. |
+| `maxHz` | `1000.0` | Upper frequency bound; sets the τ search floor. A fundamental above this reports as a subharmonic within range, by design. |
 
-**Recommended for guitar/bass tuner:**
+## Threading contract
 
-```c
-cfg.yinThreshold    = 0.20f;
-cfg.fallbackThreshold = 0.55f;
-cfg.minConfidence   = 0.55f;
-cfg.hopDivisor      = 8;
+`pitchDetectorProcess`, `pitchDetectorDrainResults`, and
+`pitchDetectorGetResult` must all be called from a single thread — typically
+the audio callback thread. There is no internal locking. If you need results
+on another thread (e.g. UI), bridge them yourself (queue, atomic, etc.).
+
+## Testing
+
+```bash
+cd Tests && make run
 ```
 
-## Swift Package Manager
+This builds and runs two binaries: `test_internal`, a white-box suite that
+reaches into the FIR anti-alias filter and 4× decimator directly, and
+`test_pitchdsp`, the main suite covering synthetic signals, a synthetic
+frequency/harmonic corpus, a cents-accuracy sweep, and a WAV corpus of real
+recorded instrument samples. The WAV metrics separate non-octave wrong notes
+(a real DSP bug, gated strictly) from exact-octave misses (a display-layer
+concern, gated more loosely) — some bass WAV fixtures in `Tests/Resources`
+intentionally contain content one octave below their filename (e.g.
+`bass_A1.wav` holds A0 = 27.5 Hz), documented in comments at the corpus
+definitions in `test_pitchdsp.c`.
+
+## Integration
 
 ```swift
-.package(url: "https://github.com/peppperrroni/PitchDSP", from: "4.0.0")
+.package(url: "https://github.com/peppperrroni/PitchDSP", exact: "1.0.0")
 ```
 
 ```swift
@@ -76,29 +99,3 @@ cfg.hopDivisor      = 8;
     dependencies: ["PitchDSP"]
 )
 ```
-
-## Tests
-
-A standalone C test suite lives in `Tests/`. It requires no external dependencies.
-
-```bash
-cd Tests
-make run        # build + run against Resources/ WAV corpus
-make clean      # remove binary
-```
-
-**Test suites:**
-
-1. **YIN Validation** — pure synthetic signals (pure tone, noise rejection, octave safety)
-2. **Synthetic Corpus** — all guitar + bass frequencies at 44100 Hz using generated sine waves
-3. **Harmonic Corpus** — fundamental + equal-amplitude 2nd harmonic (wound string simulation)
-4. **WAV Corpus** — real recorded instrument samples at 44100 Hz and 48000 Hz
-
-Acceptance criteria (stable window = frames 14–49):
-
-| Metric | Synthetic | WAV |
-|---|---|---|
-| First detection | ≤ frame 25 | ≤ frame 25 |
-| Detection rate | ≥ 80 % | ≥ 80 % |
-| Wrong note rate | ≤ 5 % | ≤ 8 % |
-| Cents std dev | ≤ 12 ¢ | ≤ 12 ¢ |

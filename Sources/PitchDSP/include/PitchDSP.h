@@ -30,6 +30,11 @@ typedef struct {
     float    confidence;  // Quality score 0..1. Combines CMNDF depth and local contrast.
                           // > 0.72 clean tone, 0.60–0.72 usable, < 0.60 rejected by the default minConfidence gate.
     uint32_t sequence;    // Increments on every fresh analysis; compare to detect stale reads.
+    float    rms;         // RMS level of the analysis window this result was measured on
+                          // (populated for invalid results too; 0 before the first analysis).
+                          // Lets consumers distinguish a played note from quiet ambience —
+                          // e.g. steady room hum is genuinely periodic and will be reported
+                          // as a pitch, but sits at the noise-floor level.
 } PitchResult;
 
 // ---------------------------------------------------------------------------

@@ -99,9 +99,9 @@ input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer,
     for i in 0..<n {
         let r = results[i]
         if r.hz > 0 {
-            print(String(format: "%7.2fs %8.2f Hz  %@  %.3f", t, r.hz, describe(r.hz), r.confidence))
+            print(String(format: "%7.2fs %8.2f Hz  %@  %.3f  rms %.4f", t, r.hz, describe(r.hz), r.confidence, r.rms))
         } else if showInvalid {
-            print(String(format: "%7.2fs        —", t))
+            print(String(format: "%7.2fs        —                      rms %.4f", t, r.rms))
         }
     }
 }

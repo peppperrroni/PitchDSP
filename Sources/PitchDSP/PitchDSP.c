@@ -77,6 +77,10 @@ struct PitchDetector {
     // Latest result (written by process, read by getResult)
     PitchResult result;
 
+    // Full-rate window RMS measured at the start of the current analysis;
+    // copied into every pushed result (valid or invalid) by push_result.
+    float       lastRms;
+
     // Result FIFO (drain API)
     PitchResult fifo[PITCH_RESULT_FIFO];
     int         fifoRead;
@@ -226,9 +230,12 @@ static void remove_dc(float* x, int n) {
 }
 
 // Queue a result (and mirror it as the "latest" for getResult).
+// The window level (d->lastRms) is captured by run_analysis before any gate,
+// so both valid and invalid results carry the level they were measured on.
 static void push_result(PitchDetector* d, float hz, float confidence) {
     d->result.hz         = hz;
     d->result.confidence = confidence;
+    d->result.rms        = d->lastRms;
     d->result.sequence++;
 
     if (d->fifoCount == PITCH_RESULT_FIFO) {
@@ -502,6 +509,7 @@ static void run_analysis(PitchDetector* d) {
     // Step 1 — gates measured on the full-rate window (input-level semantics)
     float rms, peak;
     measure_signal(d->window, N, &rms, &peak);
+    d->lastRms = rms;
     if (rms < d->config.powerThreshold || peak < d->config.peakThreshold) {
         invalidate_result(d);
         return;

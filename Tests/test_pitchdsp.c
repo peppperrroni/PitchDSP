@@ -441,6 +441,36 @@ static void test_drain_overwrites_oldest(void) {
     pitchDetectorDestroy(det);
 }
 
+static void test_result_rms_populated(void) {
+    BEGIN_TEST("api/result_rms");
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    PitchDetector* det = pitchDetectorCreate(8192, 48000.0f, cfg);
+    int hop = 8192 / cfg.hopDivisor;
+
+    // Loud tone: rms of a full-amplitude sine window ≈ 0.707 once the ring
+    // buffer is fully populated (after windowSize samples = 8 hops).
+    float* s = gen_sine(330.0f, 48000.0f, hop * 16);
+    pitchDetectorProcess(det, s, hop * 16);
+    free(s);
+    PitchResult out[16];
+    int n = pitchDetectorDrainResults(det, out, 16);
+    EXPECT(n == 16, "expected 16 results, got %d", n);
+    for (int i = 8; i < n; i++) {
+        EXPECT(fabsf(out[i].rms - 0.7071f) < 0.05f,
+               "frame %d rms=%.4f, want ~0.707 (full sine window)", i, out[i].rms);
+    }
+
+    // Silence: invalid frames must still carry the measured window level.
+    float* z = calloc((size_t)(hop * 16), sizeof(float));
+    pitchDetectorProcess(det, z, hop * 16);
+    free(z);
+    n = pitchDetectorDrainResults(det, out, 16);
+    EXPECT(n == 16, "expected 16 silence results, got %d", n);
+    EXPECT(out[15].hz < 0.0f, "last silence frame should be invalid");
+    EXPECT(out[15].rms < 0.001f, "silence rms=%.5f, want ~0", out[15].rms);
+    pitchDetectorDestroy(det);
+}
+
 static void test_maxhz_floor_enforced(void) {
     BEGIN_TEST("api/maxHz_floor");
     PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
@@ -627,6 +657,7 @@ int main(int argc, char** argv) {
     test_drain_delivers_every_analysis();
     test_drain_includes_invalid_frames();
     test_drain_overwrites_oldest();
+    test_result_rms_populated();
     test_maxhz_floor_enforced();
     test_default_config_has_maxhz();
     printf("\n");

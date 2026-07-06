@@ -79,22 +79,28 @@ print(String(format: "config: yin %.2f  fallback %.2f  minconf %.2f  range %.0fâ
              cfg.yinThreshold, cfg.fallbackThreshold, cfg.minConfidence, cfg.minHz, cfg.maxHz))
 print("time      hz        note        conf")
 
-let start = Date()
-nonisolated(unsafe) let det = detector   // single audio-tap thread, per the API contract
+// The tap closure runs on AVFAudio's own queue. It must be @Sendable and
+// nonisolated: capturing any top-level (MainActor-isolated) var would give the
+// closure dynamic MainActor isolation and crash with dispatch_assert_queue
+// when the audio queue invokes it. Capture immutable copies instead; the
+// detector and scratch buffer are single-thread by API contract (tap thread).
+let startTime = Date()
+let showInvalid = verbose
+nonisolated(unsafe) let det = detector
 nonisolated(unsafe) var results = [PitchResult](repeating: PitchResult(), count: 16)
 
-input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+input.installTap(onBus: 0, bufferSize: 1024, format: format) { @Sendable buffer, _ in
     guard let channel = buffer.floatChannelData?[0] else { return }
     pitchDetectorProcess(det, channel, Int32(buffer.frameLength))
     let n = Int(results.withUnsafeMutableBufferPointer {
         pitchDetectorDrainResults(det, $0.baseAddress, Int32($0.count))
     })
-    let t = Date().timeIntervalSince(start)
+    let t = Date().timeIntervalSince(startTime)
     for i in 0..<n {
         let r = results[i]
         if r.hz > 0 {
             print(String(format: "%7.2fs %8.2f Hz  %@  %.3f", t, r.hz, describe(r.hz), r.confidence))
-        } else if verbose {
+        } else if showInvalid {
             print(String(format: "%7.2fs        â€”", t))
         }
     }

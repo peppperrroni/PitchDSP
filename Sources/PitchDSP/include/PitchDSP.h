@@ -58,7 +58,7 @@ typedef struct {
     /// within this tolerance of CMNDF[P], the shorter period (higher frequency =
     /// truer fundamental) is preferred. Corrects sub-harmonic locking where wound
     /// strings cause YIN to settle on a longer period than the true fundamental.
-    /// Set to 0.0 to disable. Lower (e.g. 0.04) if spurious octave-up jumps appear.
+    /// Set to 0.0 to disable. Lower (e.g. 0.02) if spurious octave-up jumps appear.
     float octaveTolerance;
 
     /// Minimum confidence to report a result. Default: 0.60.
@@ -103,6 +103,7 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void);
 
 /// Create a streaming pitch detector.
 /// @param windowSize  Analysis window in samples. Recommended: 8192 (covers B0 = 30.87 Hz at 48kHz).
+///                    Must be a multiple of 4 (the internal decimation factor); other values return NULL.
 /// @param sampleRate  Audio sample rate in Hz (e.g. 44100.0, 48000.0).
 /// @param config      Initial configuration.
 /// @return Allocated detector, or NULL on failure. Caller must call pitchDetectorDestroy().

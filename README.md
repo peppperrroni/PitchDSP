@@ -20,6 +20,9 @@ for (int i = 0; i < n; i++) { /* results[i].hz > 0 = pitch */ }
 pitchDetectorDestroy(d);
 ```
 
+`windowSize` (8192 above) must be a multiple of 4 (the internal decimation
+factor); other values return NULL from `pitchDetectorCreate`.
+
 ## Algorithm
 
 The detector runs YIN (de Cheveigné & Kawahara, 2002) in two stages rather

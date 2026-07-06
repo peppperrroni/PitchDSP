@@ -66,11 +66,25 @@ static void test_decimator_alias_rejection(void) {
     free(s); pitchDetectorDestroy(d);
 }
 
+static void test_create_rejects_bad_window(void) {
+    PitchDetectorConfig cfg = pitchDetectorDefaultConfig();
+    PitchDetector* d1 = pitchDetectorCreate(8190, 48000.0f, cfg);  // % 4 != 0
+    CHECK(d1 == NULL, "windowSize 8190 (non-multiple-of-4) must be rejected");
+    PitchDetector* d2 = pitchDetectorCreate(0, 48000.0f, cfg);
+    CHECK(d2 == NULL, "windowSize 0 must be rejected");
+    PitchDetector* d3 = pitchDetectorCreate(-8192, 48000.0f, cfg);
+    CHECK(d3 == NULL, "negative windowSize must be rejected");
+    if (d1) pitchDetectorDestroy(d1);
+    if (d2) pitchDetectorDestroy(d2);
+    if (d3) pitchDetectorDestroy(d3);
+}
+
 int main(void) {
     printf("=== PitchDSP internal tests ===\n");
     test_fir_unity_dc_gain();
     test_decimator_passband();
     test_decimator_alias_rejection();
+    test_create_rejects_bad_window();
     printf("=== internal: %d passed, %d failed ===\n", t_passed, t_failed);
     return t_failed > 0 ? 1 : 0;
 }

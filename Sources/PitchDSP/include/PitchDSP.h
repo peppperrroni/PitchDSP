@@ -45,7 +45,9 @@ typedef struct {
     /// to have a reliable period.
     float peakThreshold;
 
-    /// Primary CMNDF threshold. Default: 0.15 (textbook YIN starting point).
+    /// Primary CMNDF threshold. Default: 0.20 — deliberately above the textbook
+    /// 0.15: keeps the true-period pit acceptable when low-frequency room
+    /// rumble pollutes it, preventing far-subharmonic locks (see README).
     /// Lower = stricter. Range: 0.05 (very strict) to 0.25 (permissive).
     float yinThreshold;
 

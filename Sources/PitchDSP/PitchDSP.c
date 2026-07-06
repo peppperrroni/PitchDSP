@@ -92,7 +92,14 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
     return (PitchDetectorConfig){
         .powerThreshold    = 1e-5f,   // -50 dBFS RMS gate
         .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
-        .yinThreshold      = 0.15f,   // primary CMNDF pit threshold
+        .yinThreshold      = 0.20f,   // primary CMNDF pit threshold. 0.20 (not
+                                      // the textbook 0.15): with low-frequency
+                                      // room rumble mixed into a ringing note,
+                                      // the true-period pit gets polluted to
+                                      // ~0.16-0.19 while a deep pit persists at
+                                      // a far subharmonic (note+rumble align);
+                                      // the ascending first-pit scan must still
+                                      // accept the true period first.
         .fallbackThreshold = 0.30f,   // accept global min if no pit found
         .octaveTolerance   = 0.03f,   // harmonic correction: prefer period/N if
                                       // CMNDF[period/N] < CMNDF[period] + tolerance

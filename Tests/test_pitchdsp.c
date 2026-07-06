@@ -511,6 +511,56 @@ static void wav_test(const char* label, const char* path,
 }
 
 // ==========================================================================
+//  Regression: E4 + low-frequency room rumble (subharmonic lock)
+// ==========================================================================
+// Field bug (2026-07): while a decaying E4 rings over quiet room rumble
+// (~52 Hz + ~25 Hz), the CMNDF pit at the true period hovers just above
+// yinThreshold while the pit at ~6T — where both the note's subharmonic and
+// the rumble align — sits just below it. The ascending first-pit-below-
+// threshold scan then reports E4/6 (~55 Hz) with high confidence DURING the
+// audible note. Detected values in the field log were all integer
+// subharmonics of E4: /5, /6, /7, /9, /12.
+static void test_e4_rumble_no_subharmonic_lock(const char* wav_dir) {
+    BEGIN_TEST("regression/e4_rumble_subharmonic");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/guitar_E4.wav", wav_dir);
+    int n = 0;
+    float* e4 = load_wav(path, 48000.0f, &n);
+    if (!e4) SKIP("%s not found", path);
+
+    // Add deterministic rumble: 52.3 Hz + 25.1 Hz + noise, combined amp ~0.017
+    // peak (≈ -35 dBFS; the fixture's sustain peak is ~0.2, so the note clearly
+    // dominates — a correct detector must not leave E4 while it rings).
+    uint64_t seed = 9876;
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / 48000.0f;
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        float wn = (float)(seed >> 33) / (float)UINT32_MAX * 2.0f - 1.0f;
+        e4[i] += 0.01f * (sinf(2.0f * (float)M_PI * 52.3f * t)
+                + 0.4f * sinf(2.0f * (float)M_PI * 25.1f * t)
+                + 0.3f * wn);
+    }
+
+    RunResult r = run_detector(e4, n, 48000.0f, pitchDetectorDefaultConfig());
+    free(e4);
+
+    // Sustain window: frames 12..32 (~260-700 ms) — E4 is loud there.
+    int bad = 0, checked = 0;
+    for (int i = 12; i <= 32 && i < r.count; i++) {
+        if (r.frames[i].hz <= 0.0f) continue;
+        checked++;
+        if (r.frames[i].hz < 100.0f) {
+            bad++;
+            if (bad <= 3)
+                printf("  frame %d: hz=%.1f conf=%.3f (subharmonic of ringing E4)\n",
+                       i, r.frames[i].hz, r.frames[i].confidence);
+        }
+    }
+    EXPECT(checked >= 10, "too few valid frames in sustain window (%d)", checked);
+    EXPECT(bad == 0, "%d/%d sustain frames locked below 100 Hz", bad, checked);
+}
+
+// ==========================================================================
 //  Required fixtures guard
 // ==========================================================================
 
@@ -641,6 +691,10 @@ int main(int argc, char** argv) {
     WAV48(guitar_E2, 82.407f);
     WAV48(guitar_G3, 196.000f);
 #undef WAV48
+
+    // ------------------------------------------------------------------
+    printf("\nRegression: field bugs\n");
+    test_e4_rumble_no_subharmonic_lock(wav_dir);
 
     // ------------------------------------------------------------------
     printf("\nSuite 5: Cents accuracy sweep (48000 Hz)\n");

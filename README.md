@@ -58,7 +58,7 @@ All fields are on `PitchDetectorConfig`; get defaults via
 |---|---|---|
 | `powerThreshold` | `1e-5` | RMS gate (~-50 dBFS) below which a window is skipped. |
 | `peakThreshold` | `0.005` | Peak-amplitude gate; catches decaying tails where RMS still passes but the waveform is too quiet for a reliable period. |
-| `yinThreshold` | `0.15` | Primary CMNDF pit threshold. Lower = stricter. Range 0.05 (strict) – 0.25 (permissive). |
+| `yinThreshold` | `0.20` | Primary CMNDF pit threshold. Lower = stricter. Range 0.05 (strict) – 0.25 (permissive). |
 | `fallbackThreshold` | `0.30` | Accept the global CMNDF minimum if no dip beats `yinThreshold`. |
 | `octaveTolerance` | `0.03` | Harmonic-correction margin: prefer period/N (N=2..5) if its CMNDF is within this of the detected period's. `0.0` disables. Lower it if spurious octave-up jumps appear. |
 | `minConfidence` | `0.60` | Frames below this confidence are reported invalid (`hz = -1`). |

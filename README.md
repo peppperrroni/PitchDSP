@@ -16,6 +16,8 @@ pitchDetectorProcess(d, micSamples, sampleCount);
 PitchResult results[16];
 int n = pitchDetectorDrainResults(d, results, 16);
 for (int i = 0; i < n; i++) { /* results[i].hz > 0 = pitch */ }
+// results[i].rms is the analysis-window level (also on invalid frames) —
+// use it to tell a played note from quiet-but-periodic room ambience.
 
 pitchDetectorDestroy(d);
 ```

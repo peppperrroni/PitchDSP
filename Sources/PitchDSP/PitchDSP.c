@@ -46,7 +46,6 @@
 
 struct PitchDetector {
     int         windowSize;
-    int         halfWindow;
     float       sampleRate;
     PitchDetectorConfig config;
     int         hopSize;
@@ -94,10 +93,10 @@ PitchDetectorConfig pitchDetectorDefaultConfig(void) {
         .powerThreshold    = 1e-5f,   // -50 dBFS RMS gate
         .peakThreshold     = 0.005f,  // 0.5% peak gate — stops decaying tail noise
         .yinThreshold      = 0.15f,   // primary CMNDF pit threshold
-        .fallbackThreshold = 0.25f,   // accept global min if no pit found
+        .fallbackThreshold = 0.30f,   // accept global min if no pit found
         .octaveTolerance   = 0.03f,   // harmonic correction: prefer period/N if
                                       // CMNDF[period/N] < CMNDF[period] + tolerance
-        .minConfidence     = 0.72f,   // gate: reject if depth+contrast confidence < this
+        .minConfidence     = 0.60f,   // gate: reject if depth+contrast confidence < this
         .hopDivisor        = 8,       // analysis rate = sampleRate / (windowSize/8)
         .minHz             = 25.0f,   // lower frequency limit → maxTau = sampleRate/minHz
         .maxHz             = 1000.0f, // upper frequency limit → minTau = sampleRate/maxHz
@@ -153,7 +152,6 @@ PitchDetector* pitchDetectorCreate(int windowSize, float sampleRate, PitchDetect
     int divisor = (config.hopDivisor > 0) ? config.hopDivisor : 8;
 
     d->windowSize = windowSize;
-    d->halfWindow = windowSize / 2;
     d->sampleRate = sampleRate;
     d->config     = config;
     d->hopSize    = windowSize / divisor;
@@ -400,16 +398,19 @@ static int correct_sub_harmonic_period(const float* cmndf, int period, int maxTa
     return period;
 }
 
-// Local CMNDF contrast: average value in a ±12-sample window (excluding ±2
-// around the pit centre) minus the pit value. Positive = clear pit, negative
-// = flat/noisy region.
-static float local_contrast(const float* cmndf, int tau, int H) {
-    int left  = tau - 12; if (left  < 1) left  = 1;
-    int right = tau + 12; if (right > H) right = H;
+// Local CMNDF contrast with a τ-proportional window: ±max(8, τ/8) samples,
+// excluding ±max(2, τ/32) around the pit centre. A fixed window (the old ±12)
+// is negligible relative to the pit width of low notes (A1: τ_dec ≈ 218), which
+// zeroed their contrast score and structurally capped their confidence.
+static float local_contrast(const float* cmndf, int tau, int maxTau) {
+    int half = tau / 8;  if (half < 8) half = 8;
+    int excl = tau / 32; if (excl < 2) excl = 2;
+    int left  = tau - half; if (left  < 1) left  = 1;
+    int right = tau + half; if (right > maxTau) right = maxTau;
     float sum = 0.0f;
     int   count = 0;
     for (int i = left; i <= right; i++) {
-        if (abs(i - tau) <= 2) continue;
+        if (abs(i - tau) <= excl) continue;
         sum += cmndf[i];
         count++;
     }
@@ -613,7 +614,7 @@ void pitchDetectorProcess(PitchDetector* d, const float* samples, int count) {
 }
 
 // ==========================================================================
-//  GetResult (safe from any thread)
+//  GetResult (same single-thread contract as process/drain)
 // ==========================================================================
 
 PitchResult pitchDetectorGetResult(PitchDetector* d) {

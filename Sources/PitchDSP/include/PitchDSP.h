@@ -28,7 +28,7 @@ extern "C" {
 typedef struct {
     float    hz;          // Fundamental frequency Hz; -1 = no pitch detected.
     float    confidence;  // Quality score 0..1. Combines CMNDF depth and local contrast.
-                          // > 0.72 clean tone, 0.50–0.72 usable, < 0.50 marginal/noise.
+                          // > 0.72 clean tone, 0.60–0.72 usable, < 0.60 rejected by the default minConfidence gate.
     uint32_t sequence;    // Increments on every fresh analysis; compare to detect stale reads.
 } PitchResult;
 
@@ -50,10 +50,10 @@ typedef struct {
     float yinThreshold;
 
     /// Fallback threshold — if no minimum is found below yinThreshold, accept the
-    /// global CMNDF minimum if it is below fallbackThreshold. Default: 0.25.
+    /// global CMNDF minimum if it is below fallbackThreshold. Default: 0.30.
     float fallbackThreshold;
 
-    /// Harmonic correction tolerance. Default: 0.06.
+    /// Harmonic correction tolerance. Default: 0.03.
     /// After YIN finds period P, checks P/2, P/3, P/4, P/5. If CMNDF[P/N] is
     /// within this tolerance of CMNDF[P], the shorter period (higher frequency =
     /// truer fundamental) is preferred. Corrects sub-harmonic locking where wound
@@ -61,7 +61,7 @@ typedef struct {
     /// Set to 0.0 to disable. Lower (e.g. 0.04) if spurious octave-up jumps appear.
     float octaveTolerance;
 
-    /// Minimum confidence to report a result. Default: 0.72.
+    /// Minimum confidence to report a result. Default: 0.60.
     /// Confidence = 0.75×(1−CMNDF) + 0.25×(localContrast×8), clamped 0..1.
     /// Frames below this threshold are reported as invalid (hz = -1).
     float minConfidence;

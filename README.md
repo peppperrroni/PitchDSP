@@ -90,6 +90,21 @@ intentionally contain content one octave below their filename (e.g.
 `bass_A1.wav` holds A0 = 27.5 Hz), documented in comments at the corpus
 definitions in `test_pitchdsp.c`.
 
+### Live microphone testing (macOS)
+
+```bash
+swift run mictuner                     # package defaults
+swift run mictuner --yin 0.15 --verbose   # threshold experiments, show invalid frames
+```
+
+`mictuner` captures the default input device via an `AVAudioEngine` tap (the
+same mechanism an iOS host app uses), feeds every buffer to the detector, and
+prints one line per analysis result — time, Hz, nearest note ± cents,
+confidence. All config fields are overridable from the command line, so
+detector behavior can be explored against a live instrument without any app
+integration in the loop. First run prompts for microphone permission for your
+terminal app.
+
 ## Integration
 
 ```swift

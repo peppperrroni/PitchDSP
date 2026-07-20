@@ -77,20 +77,34 @@ on another thread (e.g. UI), bridge them yourself (queue, atomic, etc.).
 
 ## Testing
 
+There are two test layers:
+
 ```bash
-cd Tests && make run
+swift test              # SPM smoke suite — any standard Swift toolchain
+cd Tests && make run     # deep C suite — the suite of record
 ```
 
-This builds and runs two binaries: `test_internal`, a white-box suite that
-reaches into the FIR anti-alias filter and 4× decimator directly, and
-`test_pitchdsp`, the main suite covering synthetic signals, a synthetic
+**`swift test`** (`Tests/PitchDSPTests/`, swift-testing) is the standard-
+toolchain smoke layer: pure sine at 440 Hz (two-stage refine accuracy),
+A1 55 Hz (the low end the two-stage decimated search exists to serve),
+silence (invalid-result gating), and the app's maxHz=1500 override detecting
+E6 (~1318.5 Hz) as itself rather than folding to its ~659 Hz subharmonic.
+Every tolerance in this suite is ported directly from the C suite below, not
+invented — see the comment on each test for its C-suite counterpart. It does
+not touch the Makefile/C build and is not a replacement for it.
+
+**`make run`** builds and runs two binaries: `test_internal`, a white-box
+suite that reaches into the FIR anti-alias filter and 4× decimator directly,
+and `test_pitchdsp`, the main suite covering synthetic signals, a synthetic
 frequency/harmonic corpus, a cents-accuracy sweep, and a WAV corpus of real
 recorded instrument samples. The WAV metrics separate non-octave wrong notes
 (a real DSP bug, gated strictly) from exact-octave misses (a display-layer
 concern, gated more loosely) — some bass WAV fixtures in `Tests/Resources`
 intentionally contain content one octave below their filename (e.g.
 `bass_A1.wav` holds A0 = 27.5 Hz), documented in comments at the corpus
-definitions in `test_pitchdsp.c`.
+definitions in `test_pitchdsp.c`. This remains the suite of record: it is
+the only one that exercises the WAV corpus, harmonic corpus, cents sweep,
+and internal white-box behavior.
 
 ## Integration
 
